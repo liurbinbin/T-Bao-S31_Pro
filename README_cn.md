@@ -52,11 +52,11 @@ idf.py --list-targets | findstr esp32s31
 # 首次配置目标芯片
 idf.py set-target esp32s31
 
-# 拉取/解析 managed_components
+# 解析仍需从注册表获取的依赖
 idf.py reconfigure
 
-# 根据 T-Bao S31 YAML 生成 Board Manager 代码
-idf.py gen-bmgr-config -b tbao_s31_board
+# T-Bao S31 的 Board Manager 生成代码已提交到 components/gen_bmgr_codes
+# 全新克隆后无需重新生成
 
 # 编译
 idf.py build
@@ -66,7 +66,7 @@ idf.py flash
 idf.py -p COM12 monitor
 ```
 
-板级 YAML（`boards/tbao_s31_board`）发生变化后，请重新执行 `gen-bmgr-config`，再执行 `idf.py reconfigure` 和 `idf.py build`。
+ESP-DL、人脸检测、项目修改过的运行时组件以及 T-Bao S31 的 Board Manager 生成组件已纳入 `components/`，不再依赖被修改的 `managed_components/`。板级 YAML（`boards/tbao_s31_board`）发生变化后，请重新执行 `idf.py gen-bmgr-config -b tbao_s31_board -c ./boards`，再执行 `idf.py reconfigure` 和 `idf.py build`。
 
 仓库提供了 [`build_only.ps1`](build_only.ps1) 和 [`esptool_flash.ps1`](esptool_flash.ps1) 作为本机自动化脚本。脚本包含本地 ESP-IDF 路径、Python 环境和 `COM12` 等默认值，使用前请检查并按实际环境修改；跨机器构建建议使用上面的 `idf.py` 命令。
 

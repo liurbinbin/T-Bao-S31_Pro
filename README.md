@@ -51,11 +51,11 @@ Run these commands from the repository root:
 # Select the target on a fresh checkout
 idf.py set-target esp32s31
 
-# Resolve managed_components
+# Resolve the remaining registry dependencies
 idf.py reconfigure
 
-# Generate Board Manager sources from the T-Bao S31 YAML files
-idf.py gen-bmgr-config -b tbao_s31_board
+# Board Manager sources for T-Bao S31 are checked into components/gen_bmgr_codes
+# No generation step is needed on a fresh checkout.
 
 # Build
 idf.py build
@@ -65,7 +65,7 @@ idf.py -p COM12 -b 921600 flash
 idf.py -p COM12 monitor
 ```
 
-After changing files under `boards/tbao_s31_board`, run `gen-bmgr-config` again, then reconfigure and build.
+The ESP-DL, face detector, patched runtime components, and generated T-Bao S31 Board Manager component are checked into `components/`; they no longer depend on modified files under `managed_components/`. After changing files under `boards/tbao_s31_board`, run `idf.py gen-bmgr-config -b tbao_s31_board -c ./boards` again, then reconfigure and build.
 
 [`build_only.ps1`](build_only.ps1) and [`esptool_flash.ps1`](esptool_flash.ps1) are included for the original local Windows setup. They contain machine-specific ESP-IDF paths, Python paths, and `COM12`; review those values before using them on another machine. The `idf.py` flow above is the portable option.
 
@@ -94,9 +94,9 @@ Use the IP address printed in the serial log.
 ```text
 main/                         application, pages, camera, audio, motion, and HTTP services
 boards/tbao_s31_board/       T-Bao S31 Board Manager definition
-components/                   local components and board adapters
-managed_components/           ESP-IDF Component Manager dependencies
-patches/                      repeatable patches for managed components
+components/                   local components, board adapters, and vendored runtime dependencies
+managed_components/           remaining ESP-IDF Component Manager dependencies
+patches/                      source patches retained for reference and any remaining managed dependencies
 assets/                       boot splash and UI assets
 docs/                         design and porting notes
 tests/                        Python contract tests

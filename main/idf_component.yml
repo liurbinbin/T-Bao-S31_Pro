@@ -6,17 +6,36 @@ dependencies:
     path: ../components/esp-dl
   espressif/human_face_detect:
     path: ../components/human_face_detect
-  jason-mao/av_processor: ^0.5.5
-  espressif/gmf_ai_audio: ~0.8
+  jason-mao/av_processor:
+    path: ../components/jason-mao__av_processor
+  espressif/gmf_ai_audio:
+    path: ../components/espressif__gmf_ai_audio
   espressif/esp_video_codec: ~0.5
   78/xiaozhi-fonts: ~1.3.2
   # GIF-style emote player (.eaf animations exported from the Espressif emote
   # tool) + the memory-mapped asset bundle reader it consumes.
-  espressif2022/esp_emote_expression: ^1.0.2
+  espressif2022/esp_emote_assets:
+    path: ../components/espressif2022__esp_emote_assets
+  espressif2022/esp_emote_expression:
+    path: ../components/espressif2022__esp_emote_expression
+  espressif2022/esp_emote_gfx:
+    path: ../components/espressif2022__esp_emote_gfx
   espressif/esp_mmap_assets: ^1.3.2
   # Registry 0.1.0 only supports IDF <6; use in-tree 0.1.1 for IDF 6.x until published.
   espressif/esp_xiaozhi:
     path: ../components/esp_xiaozhi
+  espressif/esp_board_manager:
+    path: ../components/espressif__esp_board_manager
+  espressif/esp_cam_sensor:
+    path: ../components/espressif__esp_cam_sensor
+  espressif/esp_codec_dev:
+    path: ../components/espressif__esp_codec_dev
+  espressif/esp_lvgl_port:
+    path: ../components/espressif__esp_lvgl_port
+  espressif/esp_video:
+    path: ../components/espressif__esp_video
+  espressif/gmf_core:
+    path: ../components/espressif__gmf_core
   # Use the local wrapper so WebSocket task stacks stay in cache-safe internal
   # RAM while receive payloads use the fixed PSRAM pool.
   espressif/esp_websocket_client:
