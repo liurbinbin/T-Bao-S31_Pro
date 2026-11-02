@@ -2,14 +2,14 @@
 
 基于 **T-Bao S31 / ESP32-S31** 的 AI 萌宠固件。项目将小智语音对话、圆形触摸屏表情、摄像头视觉、音乐播放和运动控制整合到一套 ESP-IDF 应用中。
 
-> 当前状态：T-Bao S31 板级配置、摄像头/音频/显示驱动和应用功能已接入工程，代码可用于构建固件；摄像头 PID、PMIC、屏幕、触摸、音频和 SD 卡仍需要在真实硬件上完成 smoke test。
+> 当前状态：T-Bao S31 板级配置、摄像头/音频/显示驱动和应用功能已接入工程，代码可用于构建固件。
 
 [English README](README.md)
 
 ## 功能
 
 - **小智语音对话**：离线唤醒词（“你好喵伴”“你好小智”）+ WebSocket 云端 ASR、LLM 和 TTS，支持表情状态和实时字幕。
-- **圆形触摸 UI**：LVGL 9 + esp_emote_expression，提供表情主页、启动器、对话、摄像头、音乐、视频、游戏、番茄钟、动作、设置和关于页面。
+- **触摸 UI**：LVGL 9 + `esp_emote_expression`，提供表情主页、启动器、对话、摄像头、音乐、视频、游戏、番茄钟、动作、设置和关于页面。
 - **摄像头与视觉**：OV2640/OV3660 兼容的 PARLIO JPEG 摄像头；支持屏幕预览、HTTP MJPEG `/stream`、JPEG 抓拍 `/snapshot`、录像、轻量人脸检测/人脸跟随和番茄钟守护模式。
 - **音乐与视频**：microSD 本地音频/视频播放；在线音乐搜索会从多个公共 API 解析可播放地址并交给播放器。
 - **运动控制**：双电机和舵机控制，支持触摸、Web、语音/MCP 等控制源，并带有速度限制、序列动作和故障保护。
@@ -52,23 +52,38 @@ idf.py --list-targets | findstr esp32s31
 # 首次配置目标芯片
 idf.py set-target esp32s31
 
-# 解析仍需从注册表获取的依赖
+# 可选：重新解析或拉取依赖
 idf.py reconfigure
-
-# T-Bao S31 的 Board Manager 生成代码已提交到 components/gen_bmgr_codes
-# 全新克隆后无需重新生成
 
 # 编译
 idf.py build
 
-# 烧录并查看串口日志（把 COM12 换成实际端口）
+# 烧录（如需指定串口，可追加 `-p COM12`）
 idf.py flash
-idf.py -p COM12 monitor
 ```
 
-ESP-DL、人脸检测、项目修改过的运行时组件以及 T-Bao S31 的 Board Manager 生成组件已纳入 `components/`，不再依赖被修改的 `managed_components/`。板级 YAML（`boards/tbao_s31_board`）发生变化后，请重新执行 `idf.py gen-bmgr-config -b tbao_s31_board -c ./boards`，再执行 `idf.py reconfigure` 和 `idf.py build`。
+### 首次配网与大模型配置
 
-仓库提供了 [`build_only.ps1`](build_only.ps1) 和 [`esptool_flash.ps1`](esptool_flash.ps1) 作为本机自动化脚本。脚本包含本地 ESP-IDF 路径、Python 环境和 `COM12` 等默认值，使用前请检查并按实际环境修改；跨机器构建建议使用上面的 `idf.py` 命令。
+固件烧录成功后，根据屏幕提示完成 Wi-Fi 配网。配网完成后，打开 [xiaozhi.me](https://xiaozhi.me/)，进入控制台并在右上角选择“添加设备”，输入屏幕或串口日志中显示的 6 位验证码，即可完成大模型配置。
+
+### 人脸跟随调参
+
+人脸跟随效果与静摩擦力有关，也会受到小车重量和桌面材质影响。如果跟随过程出现异常，可微调 [`main/face_follow_controller.c`](main/face_follow_controller.c) 第 26 行的默认参数：
+
+```c
+#define FACE_FOLLOW_DEFAULT_YAW_DRIVE 0.14f
+```
+
+建议围绕 `0.14f` 小幅调整；不确定参数含义时，可以先保留默认值或咨询 AI。
+
+板级 YAML（`boards/tbao_s31_board`）发生变化后，请重新执行：
+
+```bash
+idf.py gen-bmgr-config -b tbao_s31_board -c ./boards
+idf.py reconfigure
+idf.py build
+```
+
 
 ## SD 卡目录
 
@@ -78,17 +93,16 @@ ESP-DL、人脸检测、项目修改过的运行时组件以及 T-Bao S31 的 Bo
 | --- | --- |
 | 音乐 | `/sdcard` 根目录下的可播放音频文件 |
 | 视频 | `/sdcard` 根目录下的 MP4/AVI/MJPEG 文件 |
-| 录像 | `/sdcard/record` |
 
-## HTTP 预览
-
-设备联网后，访问设备 IP 的以下路径：
-
-- `/`：预览和设备控制页面
-- `/snapshot`：获取当前 JPEG 帧
-- `/stream`：MJPEG 流（单个长连接查看器）
-
-具体端口和网络地址以串口日志为准。
+> 注意：下载的 MP4 文件需要先通过 FFmpeg 转码后才能播放。如果本地没有 FFmpeg，可以使用 [FFmpeg 在线工具](https://ffmpeg.gcc.ac.cn/advanced_zh.html)。
+>
+> 参数 1 填写：`-y`
+>
+> 参数 2 填写：
+>
+> ```text
+> -map 0:v:0 -vf scale=320:320 -c:v mjpeg -q:v 5 -pix_fmt yuvj420p -an -r 10 -movflags +faststart -f mp4
+> ```
 
 ## 项目结构
 
@@ -102,16 +116,6 @@ assets/                       启动画面和 UI 资源
 docs/                         设计记录与移植文档
 tests/                        Python 合约测试
 ```
-
-## 测试与验证
-
-运行仓库内的静态合约测试：
-
-```bash
-python -m unittest discover -s tests -p "test_*.py"
-```
-
-构建成功只代表固件和资源可以生成。首次上板还应依次验证：摄像头传感器识别、摄像头供电电压、LCD/触摸方向、ES8389 播放、ES7210 录音、Wi-Fi 配网、SD 卡读写和电机/舵机安全停止。
 
 ## 许可证
 

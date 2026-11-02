@@ -2,14 +2,14 @@
 
 AI pet firmware for the **T-Bao S31 / ESP32-S31**. It combines Xiaozhi voice chat, a round touch UI, camera vision, media playback, and motor control in one ESP-IDF application.
 
-> Status: the T-Bao S31 board definition, camera/audio/display drivers, and application features are integrated and buildable. Camera PID, PMIC, LCD, touch, audio, and SD-card behavior still require a hardware smoke test.
+> Status: the T-Bao S31 board definition, camera/audio/display drivers, and application features are integrated and the firmware can be built.
 
 [中文说明](README_cn.md)
 
 ## Features
 
 - **Xiaozhi voice chat**: offline wake words ("你好喵伴" and "你好小智") with WebSocket cloud ASR, LLM, and TTS, plus emote states and live captions.
-- **Round touch UI**: LVGL 9 and `esp_emote_expression` with launcher, dialogue, camera, music, video, game, timer, motion, settings, and about pages.
+- **Touch UI**: LVGL 9 and `esp_emote_expression` with launcher, dialogue, camera, music, video, game, timer, motion, settings, and about pages.
 - **Camera and vision**: OV2640/OV3660-compatible PARLIO JPEG camera with on-screen preview, HTTP MJPEG `/stream`, JPEG `/snapshot`, recording, lightweight face detection/face following, and guard mode.
 - **Media playback**: local audio/video from microSD; online music search resolves a playable URL from multiple public APIs.
 - **Motion control**: dual motors and a servo with touch, Web, voice/MCP control sources, speed limits, motion sequences, and failsafe handling.
@@ -33,7 +33,7 @@ See [`pinmap_cn.md`](pinmap_cn.md) for the complete pin, power, and connector ma
 
 ## Requirements
 
-- ESP-IDF **6.1 or newer**, configured for target `esp32s31`. The repository scripts are written around a 6.2 toolchain environment.
+- ESP-IDF **6.1 or newer**, configured for target `esp32s31`.
 - Python, CMake, Ninja, and the `riscv32-esp-elf` toolchain supplied by ESP-IDF.
 
 Check the environment:
@@ -51,23 +51,37 @@ Run these commands from the repository root:
 # Select the target on a fresh checkout
 idf.py set-target esp32s31
 
-# Resolve the remaining registry dependencies
+# Optional: re-resolve or fetch dependencies
 idf.py reconfigure
-
-# Board Manager sources for T-Bao S31 are checked into components/gen_bmgr_codes
-# No generation step is needed on a fresh checkout.
 
 # Build
 idf.py build
 
-# Flash and monitor (replace COM12 with the actual port)
-idf.py -p COM12 -b 921600 flash
-idf.py -p COM12 monitor
+# Flash (append `-p COM12` when a specific port is needed)
+idf.py flash
 ```
 
-The ESP-DL, face detector, patched runtime components, and generated T-Bao S31 Board Manager component are checked into `components/`; they no longer depend on modified files under `managed_components/`. After changing files under `boards/tbao_s31_board`, run `idf.py gen-bmgr-config -b tbao_s31_board -c ./boards` again, then reconfigure and build.
+### First-time provisioning and model setup
 
-[`build_only.ps1`](build_only.ps1) and [`esptool_flash.ps1`](esptool_flash.ps1) are included for the original local Windows setup. They contain machine-specific ESP-IDF paths, Python paths, and `COM12`; review those values before using them on another machine. The `idf.py` flow above is the portable option.
+After flashing, follow the on-screen instructions to provision Wi-Fi. Then open [xiaozhi.me](https://xiaozhi.me/), go to the console, choose "Add device" in the upper-right corner, and enter the six-digit code shown on the display or in the serial log to configure the cloud model.
+
+### Face-follow tuning
+
+Face-follow behavior depends on static friction, vehicle weight, and the surface material. If tracking is unstable, adjust the default value at line 26 of [`main/face_follow_controller.c`](main/face_follow_controller.c):
+
+```c
+#define FACE_FOLLOW_DEFAULT_YAW_DRIVE 0.14f
+```
+
+Make small changes around `0.14f`; keep the default or consult an AI assistant when unsure about the parameter.
+
+After changing files under `boards/tbao_s31_board`, run:
+
+```bash
+idf.py gen-bmgr-config -b tbao_s31_board -c ./boards
+idf.py reconfigure
+idf.py build
+```
 
 ## SD-card layout
 
@@ -77,40 +91,29 @@ The application mounts the card at `/sdcard`:
 | --- | --- |
 | Music | Playable audio files in `/sdcard` |
 | Video | MP4/AVI/MJPEG files in `/sdcard` |
-| Recordings | `/sdcard/record` |
 
-## HTTP preview
-
-After the device joins Wi-Fi, open the device IP at:
-
-- `/` for the preview and device controls
-- `/snapshot` for the current JPEG frame
-- `/stream` for an MJPEG stream (one long-lived viewer)
-
-Use the IP address printed in the serial log.
+> Note: downloaded MP4 files must be transcoded with FFmpeg before playback. If FFmpeg is not installed locally, use the [FFmpeg online tool](https://ffmpeg.gcc.ac.cn/advanced_zh.html).
+>
+> Parameter 1: `-y`
+>
+> Parameter 2:
+>
+> ```text
+> -map 0:v:0 -vf scale=320:320 -c:v mjpeg -q:v 5 -pix_fmt yuvj420p -an -r 10 -movflags +faststart -f mp4
+> ```
 
 ## Project layout
 
 ```text
 main/                         application, pages, camera, audio, motion, and HTTP services
 boards/tbao_s31_board/       T-Bao S31 Board Manager definition
-components/                   local components, board adapters, and vendored runtime dependencies
-managed_components/           remaining ESP-IDF Component Manager dependencies
-patches/                      source patches retained for reference and any remaining managed dependencies
+components/                   local components (ESP-DL, face detection, board adapters, and more)
+managed_components/           ESP-IDF Component Manager dependencies
+patches/                      repeatable patches for managed components
 assets/                       boot splash and UI assets
 docs/                         design and porting notes
 tests/                        Python contract tests
 ```
-
-## Tests and validation
-
-Run the repository's static contract tests:
-
-```bash
-python -m unittest discover -s tests -p "test_*.py"
-```
-
-A successful build only confirms that the firmware and generated assets can be produced. On first hardware bring-up, also verify camera detection and power rails, LCD/touch orientation, ES8389 playback, ES7210 capture, Wi-Fi provisioning, SD-card I/O, and motor/servo safe stop behavior.
 
 ## License
 
