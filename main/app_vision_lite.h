@@ -10,7 +10,7 @@
  * support, only ~912KB model partition, tight internal RAM), so this module is
  * the practical offline alternative:
  *
- *   - feed it the PPA RGB565 preview (240x240) each frame
+ *   - feed it the hardware-decoded RGB565 preview (320x320) each frame
  *   - it downsamples to grayscale, computes inter-frame difference
  *   - reports: motion ratio, activity level (0=没人 1=安静 2=活跃), wave flag
  *
@@ -52,17 +52,9 @@ esp_err_t app_vision_lite_init(void);
 
 /**
  * @brief Feed one RGB565 preview frame (w x h). Runs a lightweight downscale to
- *        grayscale + inter-frame diff. Cheap (<1 ms for 240x240 on 320 MHz).
- *        `w`/`h` should be the PPA preview size (CAM_PREVIEW_W/H).
+ *        grayscale + inter-frame diff. `w`/`h` should be CAM_PREVIEW_W/H.
  */
 void app_vision_lite_feed_rgb565(const uint8_t *rgb565, int w, int h, uint32_t ms);
-
-/**
- * @brief Feed one raw UYVY frame directly (1280x720). Downscales in software to
- *        grayscale. Slower than feeding the PPA preview, use only when the PPA
- *        path is unavailable (e.g. guard mode without the camera page).
- */
-void app_vision_lite_feed_uyvy(const uint8_t *uyvy, int w, int h, uint32_t ms);
 
 /**
  * @brief Get the latest analysis result (thread-safe snapshot).

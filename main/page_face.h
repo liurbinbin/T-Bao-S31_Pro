@@ -8,9 +8,9 @@
 extern "C" {
 #endif
 
-/* The animated face page (esp_emote_expression). Drives emotion auto-rotation,
- * tap / long-press "act cute" reactions, and forwards chat + status to the
- * emote toast/status events. */
+/* The animated face page (esp_emote_expression). Drives idle emotion rotation,
+ * random tap changes, long-press laugh reactions, and forwards chat + status
+ * to the emote toast/status events. */
 extern const ui_page_t page_face;
 
 #ifdef __cplusplus

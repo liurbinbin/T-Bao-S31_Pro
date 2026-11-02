@@ -4,7 +4,7 @@
  * app_guard_mode.h — 番茄时钟"守护模式" (desk-watch).
  *
  * While a pomodoro is running the user can start guard mode: the camera runs in
- * the background (reusing the PPA preview path), frames are analyzed by
+ * the background, frames are decoded by the hardware JPEG engine and analyzed by
  * app_vision_lite (motion / activity), and the module reports whether the child
  * is still at the desk. If nobody is detected for too long, the caller is
  * notified via the returned status so it can show an alert.
@@ -12,8 +12,8 @@
  * Implementation notes:
  *   - Camera is reference-counted (app_camera_start), so it can coexist with the
  *     camera page / MJPEG /take_photo.
- *   - A small task copies the latest UYVY frame, runs the PPA UYVY->RGB565
- *     transform and feeds app_vision_lite at a reduced rate (GUARD_ANALYZE_MS)
+ *   - A small task copies the latest JPEG frame, decodes it to RGB565 and feeds
+ *     app_vision_lite at a reduced rate (GUARD_ANALYZE_MS)
  *     to keep CPU free for the LVGL + audio.
  *   - "no body" state: after GUARD_NOBODY_ALERT_MS without any activity the
  *     status flips to GUARD_STATUS_ABSENT.

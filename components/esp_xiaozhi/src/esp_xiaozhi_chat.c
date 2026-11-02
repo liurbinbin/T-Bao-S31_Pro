@@ -345,12 +345,12 @@ static bool esp_xiaozhi_chat_is_audio_ready(esp_xiaozhi_chat_t *xiaozhi_chat)
 static esp_err_t esp_xiaozhi_chat_set_listening_mode(esp_xiaozhi_chat_t *xiaozhi_chat, esp_xiaozhi_chat_listening_mode_t mode)
 {
     const char *const mode_str[] = {
-        "unknown",
         "realtime",
         "auto",
         "manual",
+        "auto_stop",
         "manual_stop",
-        "auto_stop"
+        "unknown",
     };
 
     if (xiaozhi_chat->listening_mode == mode) {
@@ -415,6 +415,8 @@ static esp_err_t esp_xiaozhi_chat_hello_handler(esp_xiaozhi_chat_t *xiaozhi_chat
         if (cJSON_IsNumber(frame_duration)) {
             xiaozhi_chat->server_frame_duration = frame_duration->valueint;
         }
+        ESP_LOGI(TAG, "Server audio params: sample_rate=%d, frame_duration=%d",
+                 xiaozhi_chat->server_sample_rate, xiaozhi_chat->server_frame_duration);
     }
 
     if (strcmp(transport->valuestring, "udp") == 0) {
@@ -524,7 +526,7 @@ static esp_err_t esp_xiaozhi_chat_mcp_handler(esp_xiaozhi_chat_t *xiaozhi_chat, 
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "Received MCP message: %s", payload_mcp);
+    ESP_LOGD(TAG, "Received MCP message: %s", payload_mcp);
 
     esp_err_t ret = esp_xiaozhi_mcp_handle_message(xiaozhi_chat->mcp_mgr_handle,
                                                    "mcp_server",
@@ -665,6 +667,11 @@ static esp_err_t esp_xiaozhi_chat_data_handler(esp_xiaozhi_transport_handle_t ha
         cJSON_Delete(root);
         return ESP_ERR_INVALID_ARG;
     }
+
+    /* Log every server message type. tts start/stop are also surfaced as
+     * chat start/stop by the app; seeing the raw type here proves whether the
+     * server answered a rearmed turn at all. */
+    ESP_LOGI(TAG, "Incoming message: type=%s", type->valuestring);
 
     esp_err_t ret = ESP_OK;
     esp_xiaozhi_chat_type_func_t esp_xiaozhi_chat_type_handlers[] = {
@@ -808,6 +815,9 @@ static esp_err_t esp_xiaozhi_chat_get_hello_message(esp_xiaozhi_chat_t *xiaozhi_
     }
 
     cJSON_AddBoolToObject(features, "mcp", true);
+    /* Upstream only adds "aec": true when CONFIG_USE_SERVER_AEC is enabled;
+     * with server AEC off (this board, and upstream's own default) the field
+     * is omitted entirely. Match that exactly. */
     cJSON_AddItemToObject(root, "features", features);
 
     cJSON *audio_params = cJSON_CreateObject();
@@ -843,7 +853,14 @@ static void esp_xiaozhi_chat_audio_input_exit(EventGroupHandle_t evt)
     if (evt != NULL) {
         xEventGroupSetBits(evt, ESP_XIAOZHI_CHAT_RECV_TASK_EXITED);
     }
+#if CONFIG_XIAOZHI_AUDIO_TASK_ALLOC_STATIC
     vTaskDelete(NULL);
+#else
+    /* The dynamic path creates this task with
+     * xTaskCreatePinnedToCoreWithCaps(); a plain vTaskDelete() would leak its
+     * (possibly PSRAM) stack and TCB on every audio-channel close. */
+    vTaskDeleteWithCaps(NULL);
+#endif
 }
 
 static esp_err_t esp_xiaozhi_chat_create_audio_input_task(esp_xiaozhi_chat_t *xiaozhi_chat)
@@ -898,8 +915,11 @@ static esp_err_t esp_xiaozhi_chat_stop_runtime(esp_xiaozhi_chat_t *xiaozhi_chat)
     esp_err_t ret = ESP_OK;
     esp_err_t step_ret = esp_xiaozhi_chat_close_audio_channel((esp_xiaozhi_chat_handle_t)xiaozhi_chat);
     if (step_ret != ESP_OK) {
+        /* Do not fail the whole stop: the audio channel is a best-effort
+         * close, and a previous stop may already have released the transport
+         * handle.  Propagating this error used to abort chat deinit and leave
+         * the singleton registered, blocking every later enable. */
         ESP_LOGW(TAG, "Failed to close audio channel during stop: %s", esp_err_to_name(step_ret));
-        ret = step_ret;
     }
 
     if (xiaozhi_chat->mcp_mgr_handle != 0) {
@@ -921,7 +941,12 @@ static esp_err_t esp_xiaozhi_chat_stop_runtime(esp_xiaozhi_chat_t *xiaozhi_chat)
             xiaozhi_chat->mcp_mgr_handle = 0;
         }
     }
-    xiaozhi_chat->mcp_chat_handle = 0;
+    /* Keep the transport handle until the MCP manager has actually been
+     * deinitialized. Clearing it after a failed stop would orphan a live
+     * WebSocket task and make a later retry impossible. */
+    if (xiaozhi_chat->mcp_mgr_handle == 0) {
+        xiaozhi_chat->mcp_chat_handle = 0;
+    }
 
     return ret;
 }
@@ -1347,6 +1372,7 @@ esp_err_t esp_xiaozhi_chat_deinit(esp_xiaozhi_chat_handle_t chat_hd)
     ret = esp_xiaozhi_chat_stop_runtime(xiaozhi_chat);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to stop chat runtime during deinit: %s", esp_err_to_name(ret));
+        return ret;
     }
 
     if (xiaozhi_chat->udp != NULL && xiaozhi_chat->udp->audio_receive_events != NULL) {
@@ -1438,9 +1464,19 @@ esp_err_t esp_xiaozhi_chat_start(esp_xiaozhi_chat_handle_t chat_hd)
 
 error:
 
-    esp_mcp_mgr_stop(xiaozhi_chat->mcp_mgr_handle);
-    esp_mcp_mgr_deinit(xiaozhi_chat->mcp_mgr_handle);
-    xiaozhi_chat->mcp_mgr_handle = 0;
+    if (xiaozhi_chat->mcp_mgr_handle != 0) {
+        esp_err_t cleanup_ret = esp_mcp_mgr_stop(xiaozhi_chat->mcp_mgr_handle);
+        if (cleanup_ret == ESP_OK) {
+            cleanup_ret = esp_mcp_mgr_deinit(xiaozhi_chat->mcp_mgr_handle);
+        }
+        if (cleanup_ret == ESP_OK) {
+            xiaozhi_chat->mcp_mgr_handle = 0;
+            xiaozhi_chat->mcp_chat_handle = 0;
+        } else {
+            ESP_LOGW(TAG, "Failed to clean up MCP manager after start error: %s",
+                     esp_err_to_name(cleanup_ret));
+        }
+    }
 
     return ret;
 }
@@ -1453,6 +1489,28 @@ esp_err_t esp_xiaozhi_chat_stop(esp_xiaozhi_chat_handle_t chat_hd)
 
     esp_err_t ret = esp_xiaozhi_chat_stop_runtime(xiaozhi_chat);
     return ret;
+}
+
+static void esp_xiaozhi_chat_abort_audio_open(
+    esp_xiaozhi_chat_t *xiaozhi_chat)
+{
+    if (xiaozhi_chat == NULL) {
+        return;
+    }
+
+    /* This path is also used after MQTT UDP allocation, so close the audio
+     * side even when the WebSocket hello did not complete. */
+    (void)esp_xiaozhi_chat_audio_close(xiaozhi_chat);
+    xiaozhi_chat->audio_channel_opened = false;
+    xiaozhi_chat->error_occurred = true;
+    memset(xiaozhi_chat->session_id, 0, sizeof(xiaozhi_chat->session_id));
+
+    esp_err_t ret = esp_xiaozhi_transport_stop_connection(
+        xiaozhi_chat->mcp_chat_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to release failed audio session: %s",
+                 esp_err_to_name(ret));
+    }
 }
 
 esp_err_t esp_xiaozhi_chat_open_audio_channel(esp_xiaozhi_chat_handle_t chat_hd, const esp_xiaozhi_chat_audio_t *audio,
@@ -1470,6 +1528,21 @@ esp_err_t esp_xiaozhi_chat_open_audio_channel(esp_xiaozhi_chat_handle_t chat_hd,
     }
 
     ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_validate_audio_params(audio), TAG, "Invalid audio parameters");
+
+    if (xiaozhi_chat->audio_channel_opened) {
+        ESP_LOGW(TAG, "Audio channel is already open; refusing duplicate open");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* A previous failed attempt may have received FINISH just before the
+     * caller retries. Force the old session through the same cleanup path
+     * before creating a new hello conversation. */
+    ret = esp_xiaozhi_transport_stop_connection(xiaozhi_chat->mcp_chat_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to clear previous audio session: %s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
 
     if (!message || !message_len) {
         uint16_t alloc_size = (message_len > 0) ? message_len : CONFIG_XIAOZHI_HELLO_MESSAGE_SIZE;
@@ -1494,15 +1567,26 @@ esp_err_t esp_xiaozhi_chat_open_audio_channel(esp_xiaozhi_chat_handle_t chat_hd,
     if (message_allocated) {
         free(message);
     }
-    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to send hello message");
+    if (ret != ESP_OK) {
+        esp_xiaozhi_chat_abort_audio_open(xiaozhi_chat);
+        ESP_LOGW(TAG, "Failed to send hello message: %s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
 
     EventBits_t bits = xEventGroupWaitBits(xiaozhi_chat->event_group_handle, ESP_XIAOZHI_CHAT_SERVER_HELLO, pdTRUE, pdFALSE, pdMS_TO_TICKS(10000));
     if (!(bits & ESP_XIAOZHI_CHAT_SERVER_HELLO)) {
-        ESP_RETURN_ON_ERROR(ESP_ERR_INVALID_ARG, TAG, "Failed to receive server hello");
+        esp_xiaozhi_chat_abort_audio_open(xiaozhi_chat);
+        ESP_LOGW(TAG, "Failed to receive server hello");
+        return ESP_ERR_TIMEOUT;
     }
 
     ret = esp_xiaozhi_chat_audio_open(xiaozhi_chat);
-    ESP_RETURN_ON_ERROR(ret, TAG, "Failed to open audio %s", esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        esp_xiaozhi_chat_abort_audio_open(xiaozhi_chat);
+        ESP_LOGW(TAG, "Failed to open audio: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
     esp_event_post(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_AUDIO_CHANNEL_OPENED, NULL, 0, portMAX_DELAY);
 
@@ -1514,6 +1598,14 @@ esp_err_t esp_xiaozhi_chat_close_audio_channel(esp_xiaozhi_chat_handle_t chat_hd
     ESP_RETURN_ON_FALSE(chat_hd, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
 
     esp_xiaozhi_chat_t *xiaozhi_chat = (esp_xiaozhi_chat_t *)chat_hd;
+    if (xiaozhi_chat->mcp_chat_handle == 0 &&
+            !xiaozhi_chat->audio_channel_opened &&
+            xiaozhi_chat->session_id[0] == '\0') {
+        /* Already closed: stop is called twice on the disable path (once via
+         * esp_xiaozhi_chat_stop, once from deinit).  Do not post a second
+         * CLOSED event or touch local audio again. */
+        return ESP_OK;
+    }
     if (strlen(xiaozhi_chat->session_id) > 0) {
         cJSON *root = cJSON_CreateObject();
         if (root) {
@@ -1531,6 +1623,17 @@ esp_err_t esp_xiaozhi_chat_close_audio_channel(esp_xiaozhi_chat_handle_t chat_hd
     esp_xiaozhi_chat_audio_close(xiaozhi_chat);
 
     esp_event_post(ESP_XIAOZHI_CHAT_EVENTS, ESP_XIAOZHI_CHAT_EVENT_AUDIO_CHANNEL_CLOSED, NULL, 0, portMAX_DELAY);
+
+    /* The official XiaoZhi client owns one WebSocket per audio conversation.
+     * Release the finished session so the next wake starts from a clean TLS
+     * and socket state instead of relying on an idle auto-reconnect loop. */
+    esp_err_t transport_ret = esp_xiaozhi_transport_stop_connection(
+        xiaozhi_chat->mcp_chat_handle);
+    if (transport_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to stop WebSocket conversation: %s",
+                 esp_err_to_name(transport_ret));
+        return transport_ret;
+    }
 
     return ESP_OK;
 }
@@ -1568,6 +1671,8 @@ esp_err_t esp_xiaozhi_chat_send_wake_word(esp_xiaozhi_chat_handle_t chat_hd, con
 
     ret = esp_xiaozhi_chat_send_json_message(xiaozhi_chat, root);
     cJSON_Delete(root);
+    ESP_LOGI(TAG, "Send wake word detect (%s): %s", wake_word,
+             esp_err_to_name(ret));
     return ret;
 }
 
@@ -1576,9 +1681,22 @@ esp_err_t esp_xiaozhi_chat_send_start_listening(esp_xiaozhi_chat_handle_t chat_h
     ESP_RETURN_ON_FALSE(chat_hd, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
 
     esp_xiaozhi_chat_t *xiaozhi_chat = (esp_xiaozhi_chat_t *)chat_hd;
-    const char *mode_str = (mode == ESP_XIAOZHI_CHAT_LISTENING_MODE_REALTIME) ? "realtime" :
-                           (mode == ESP_XIAOZHI_CHAT_LISTENING_MODE_AUTO) ? "auto" :
-                           (mode == ESP_XIAOZHI_CHAT_LISTENING_MODE_MANUAL) ? "manual" : "unknown";
+    const char *mode_str = "unknown";
+    switch (mode) {
+    case ESP_XIAOZHI_CHAT_LISTENING_MODE_REALTIME:
+        mode_str = "realtime";
+        break;
+    case ESP_XIAOZHI_CHAT_LISTENING_MODE_AUTO:
+    case ESP_XIAOZHI_CHAT_LISTENING_MODE_AUTO_STOP:
+        mode_str = "auto";
+        break;
+    case ESP_XIAOZHI_CHAT_LISTENING_MODE_MANUAL:
+    case ESP_XIAOZHI_CHAT_LISTENING_MODE_MANUAL_STOP:
+        mode_str = "manual";
+        break;
+    default:
+        break;
+    }
 
     cJSON *root = NULL;
     esp_err_t ret = esp_xiaozhi_chat_create_session_message(xiaozhi_chat, "listen", &root);
@@ -1589,6 +1707,8 @@ esp_err_t esp_xiaozhi_chat_send_start_listening(esp_xiaozhi_chat_handle_t chat_h
 
     ret = esp_xiaozhi_chat_send_json_message(xiaozhi_chat, root);
     cJSON_Delete(root);
+    ESP_LOGI(TAG, "Send listen start (mode=%s): %s", mode_str,
+             esp_err_to_name(ret));
     return ret;
 }
 
@@ -1623,5 +1743,6 @@ esp_err_t esp_xiaozhi_chat_send_abort_speaking(esp_xiaozhi_chat_handle_t chat_hd
 
     ret = esp_xiaozhi_chat_send_json_message(xiaozhi_chat, root);
     cJSON_Delete(root);
+    ESP_LOGI(TAG, "Send abort (%s): %s", reason_str, esp_err_to_name(ret));
     return ret;
 }

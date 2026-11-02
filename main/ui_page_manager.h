@@ -8,8 +8,8 @@
  * / music / game pages). Only one renderer can drive the panel at a time, so the
  * manager toggles between them via esp_xiaozhi_chat_display_set_face_visible().
  *
- * Swipe left/right navigates between pages by default; a page may consume a
- * gesture (return true from on_gesture) to override navigation.
+ * Navigation is hierarchical: FACE <-> LAUNCHER, and feature pages return to
+ * LAUNCHER. A page may consume a gesture to keep swipes for its own controls.
  */
 #pragma once
 
@@ -25,11 +25,17 @@ extern "C" {
 typedef enum {
     PAGE_FACE = 0,       /* emote face (home / 表情主页) */
     PAGE_LAUNCHER,       /* app-grid desktop (手机桌面, 上滑唤出) */
+    PAGE_XIAOZHI,        /* Xiaozhi AI runtime controls */
     PAGE_DIALOGUE,
     PAGE_CAMERA,
     PAGE_MUSIC,
+    PAGE_VIDEO,
     PAGE_GAME,
     PAGE_TIMER,
+    PAGE_EMOTION,       /* manual expression selector */
+    PAGE_SETTINGS,      /* device settings and system information */
+    PAGE_MOTION,        /* differential-drive desk motion controls */
+    PAGE_FACE_FOLLOW,   /* camera preview with offline face-follow control */
     PAGE_MAX,
 } ui_page_id_t;
 
@@ -39,6 +45,9 @@ typedef struct {
     esp_err_t (*on_enter)(void);
     esp_err_t (*on_exit)(void);
     bool      (*on_gesture)(ui_gesture_t g);   /* return true to consume */
+    bool      (*on_gesture_at)(ui_gesture_t g, int x, int y);
+    bool      (*is_direct_mode)(void);
+    bool      (*on_direct_gesture_at)(ui_gesture_t g, int x, int y);
     void      (*on_tick)(uint32_t ms);
     void      (*on_chat)(chat_role_t role, const char *text);
     void      (*on_status)(const char *status);
@@ -56,6 +65,12 @@ esp_err_t ui_page_manager_init(const ui_page_t *pages[], int count);
  *         on_exit / on_enter. No-op if already on that page.
  */
 esp_err_t ui_page_manager_switch(ui_page_id_t id);
+
+/** Allow the next face-follow switch despite the Xiaozhi resource guard. */
+void ui_page_manager_allow_face_follow_once(void);
+
+/** Rebuild the active LVGL page in place, preserving the current page id. */
+esp_err_t ui_page_manager_reload_current(void);
 
 /**
  * @brief  Current page id (PAGE_FACE if manager not started).

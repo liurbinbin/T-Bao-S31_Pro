@@ -32,6 +32,11 @@ typedef enum {
 esp_err_t app_music_player_init(esp_codec_dev_handle_t play_dev, int sample_rate);
 
 /**
+ * @brief Stop and destroy the music player, releasing its task and buffers.
+ */
+esp_err_t app_music_player_deinit(void);
+
+/**
  * @brief  Start playing a stream by URL (https://...mp3 etc).
  */
 esp_err_t app_music_player_play(const char *url);

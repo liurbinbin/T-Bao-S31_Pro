@@ -170,7 +170,10 @@ static esp_err_t esp_cam_sensor_io_parl_probe(const esp_cam_sensor_io_parl_confi
 
     if (config->xclk_io >= 0) {
         ESP_LOGD(TAG, "Enabling XCLK output");
-        camera_enable_out_clock(config);
+        ret = camera_enable_out_clock(config);
+        if (ret != ESP_OK) {
+            goto err;
+        }
     }
 
     if (config->sda_io != -1) {
@@ -260,6 +263,12 @@ static esp_err_t esp_cam_sensor_io_parl_probe(const esp_cam_sensor_io_parl_confi
     return esp_cam_sensor_io_parl_interface->reset(esp_cam_sensor_io_parl);
 err:
     camera_disable_out_clock();
+    /* sccb_probe() may already have attached a device to the caller's bus.
+     * Remove it on every failure path: a stale device handle would otherwise
+     * be removed from a later, re-created bus (use-after-free in the I2C
+     * driver) and corrupt the internal heap. */
+    (void)sccb_deinit();
+    heap_caps_free(esp_cam_sensor_io_parl);
     return ret;
 }
 
@@ -347,21 +356,23 @@ esp_err_t esp_cam_new_sensor_io_parl(const esp_cam_sensor_io_parl_config_t *conf
     return ESP_OK;
 
 fail:
-    esp_cam_del_sensor_io_parl();
+    if (esp_cam_sensor_io_parl_interface != NULL) {
+        (void)esp_cam_del_sensor_io_parl();
+    }
     return err;
 }
 
 esp_err_t esp_cam_del_sensor_io_parl(void) {
     ESP_RETURN_ON_FALSE(esp_cam_sensor_io_parl_interface != NULL, ESP_ERR_NOT_FOUND, TAG, "Camera not detected");
-    camera_disable_out_clock();
-    sccb_deinit();
-
-    heap_caps_free(esp_cam_sensor_io_parl_interface);
+    esp_cam_sensor_io_parl_handle_t sensor = esp_cam_sensor_io_parl_interface;
+    esp_cam_sensor_io_parl_controlled_t *controlled = esp_cam_sensor_io_parl_controlled_interface;
     esp_cam_sensor_io_parl_interface = NULL;
+    esp_cam_sensor_io_parl_controlled_interface = NULL;
 
-    if (esp_cam_sensor_io_parl_controlled_interface) {
-        heap_caps_free(esp_cam_sensor_io_parl_controlled_interface);
-    }
+    camera_disable_out_clock();
+    (void)sccb_deinit();
+    heap_caps_free(sensor);
+    heap_caps_free(controlled);
 
     return ESP_OK;
 }

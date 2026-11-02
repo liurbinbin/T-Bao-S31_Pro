@@ -19,7 +19,7 @@ dependencies:
   # without the underscore prefix.
   xiaozhi-fonts:
     version: "*"
-    override_path: "../../../78__xiaozhi-fonts"
+    override_path: "../78__xiaozhi-fonts"
   idf:
     version: '>=5.0'
 description: ESP-Brookesia-Expression-Emote is a component for managing expression

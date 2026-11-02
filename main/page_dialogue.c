@@ -14,9 +14,15 @@
 #include <time.h>
 #include "lvgl.h"
 #include "app_chat_history.h"
+#include "app_language.h"
 #include "esp_xiaozhi_chat_display.h"
+#include "font_awesome_symbols.h"
+#include "page_launcher.h"
+#include "ui_page_style.h"
+#include "launcher_icons.h"
 
 LV_FONT_DECLARE(font_puhui_20_4);
+LV_FONT_DECLARE(font_puhui_16_4);
 
 /* Layout constants (360px wide round panel). */
 #define BUBBLE_MAX_W   (LV_HOR_RES - 28)
@@ -59,8 +65,11 @@ static void add_bubble(chat_role_t role, const char *text, uint32_t ts)
     if (!s_ready || s_scroll == NULL) {
         return;
     }
-    const char *who = (role == CHAT_ROLE_USER) ? "你"
-                     : (role == CHAT_ROLE_ASSISTANT) ? "喵伴" : "系统";
+    const char *who = app_language_text(
+        (role == CHAT_ROLE_USER) ? "你" :
+        (role == CHAT_ROLE_ASSISTANT) ? "喵伴" : "系统",
+        (role == CHAT_ROLE_USER) ? "You" :
+        (role == CHAT_ROLE_ASSISTANT) ? "Miaoban" : "System");
     char tsbuf[16];
     fmt_ts(ts, tsbuf, sizeof(tsbuf));
 
@@ -126,31 +135,27 @@ esp_err_t page_dialogue_on_enter(void)
     if (root == NULL) {
         return ESP_FAIL;
     }
-    lv_obj_set_style_bg_color(root, lv_color_black(), 0);
-
-    /* Home / back button (top-left) + title. */
-    extern lv_obj_t *ui_page_make_back_button(lv_obj_t *);
+    ui_page_style_root(root);
     ui_page_make_back_button(root);
-    lv_obj_t *title = lv_label_create(root);
-    lv_label_set_text(title, "对话记录");
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_set_style_text_font(title, &font_puhui_20_4, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+    ui_page_make_header_image(root, &launcher_icon_dialogue, "对话", "实时记录");
 
     s_status = lv_label_create(root);
-    lv_label_set_text(s_status, "就绪");
-    lv_obj_set_style_text_color(s_status, lv_color_hex(0xBBBBBB), 0);
-    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 32);
+    lv_label_set_text(s_status, app_language_text("就绪", "Ready"));
+    lv_obj_set_width(s_status, LV_HOR_RES - 20);
+    lv_obj_set_style_text_font(s_status, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(s_status, lv_color_hex(0x8C9AA3), 0);
+    lv_obj_set_style_text_align(s_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, 55);
 
     s_scroll = lv_obj_create(root);
-    lv_obj_set_size(s_scroll, LV_HOR_RES - 8, LV_VER_RES - 66);
-    lv_obj_align(s_scroll, LV_ALIGN_TOP_MID, 0, 54);
+    lv_obj_set_size(s_scroll, LV_HOR_RES - 20, LV_VER_RES - 88);
+    lv_obj_align(s_scroll, LV_ALIGN_TOP_MID, 0, 78);
     lv_obj_set_flex_flow(s_scroll, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_scroll, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_bg_opa(s_scroll, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_scroll, 0, 0);
-    lv_obj_set_style_pad_all(s_scroll, 3, 0);
-    lv_obj_set_style_pad_row(s_scroll, 4, 0);
+    lv_obj_set_style_pad_all(s_scroll, 5, 0);
+    lv_obj_set_style_pad_row(s_scroll, 6, 0);
     lv_obj_set_scroll_dir(s_scroll, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_scroll, LV_SCROLLBAR_MODE_AUTO);
 

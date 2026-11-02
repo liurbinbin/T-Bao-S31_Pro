@@ -18,13 +18,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <cJSON.h>
+#include <nvs.h>
 
 #include "esp_xiaozhi_board.h"
 #include "esp_xiaozhi_keystore.h"
 
 static const char *TAG = "ESP_XIAOZHI_BOARD";
 
-#define LANG_CODE "zh-CN"
+static const char *board_language_code(void)
+{
+    static char code[6] = "zh-CN";
+    nvs_handle_t handle;
+    if (nvs_open("app_settings", NVS_READONLY, &handle) == ESP_OK) {
+        uint8_t language = 0;
+        if (nvs_get_u8(handle, "language", &language) == ESP_OK && language == 1) {
+            memcpy(code, "en-US", sizeof(code));
+        } else {
+            memcpy(code, "zh-CN", sizeof(code));
+        }
+        nvs_close(handle);
+    }
+    return code;
+}
 
 esp_err_t esp_xiaozhi_chat_get_board_info(esp_xiaozhi_chat_board_info_t *board_info)
 {
@@ -87,7 +102,7 @@ esp_err_t esp_xiaozhi_chat_get_board_json(esp_xiaozhi_chat_board_info_t *board_i
     esp_flash_get_size(NULL, &flash_size);
 
     cJSON_AddNumberToObject(root, "version", 2);
-    cJSON_AddStringToObject(root, "language", LANG_CODE);
+    cJSON_AddStringToObject(root, "language", board_language_code());
     cJSON_AddNumberToObject(root, "flash_size", flash_size);
     cJSON_AddNumberToObject(root, "minimum_free_heap_size", esp_get_minimum_free_heap_size());
     cJSON_AddStringToObject(root, "mac_address", board_info->mac_address);

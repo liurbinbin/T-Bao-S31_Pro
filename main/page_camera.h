@@ -8,8 +8,7 @@
 extern "C" {
 #endif
 
-/* Camera preview page (placeholder). The real SC101IOT preview + MJPEG server
- * is wired in by the camera-driver task; for now it shows a placeholder. */
+/* Camera preview page backed by the T-Bao S31 JPEG camera pipeline. */
 extern const ui_page_t page_camera;
 
 #ifdef __cplusplus

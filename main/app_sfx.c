@@ -6,30 +6,60 @@
 #include <math.h>
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "esp_log.h"
-
-static const char *TAG = "APP_SFX";
 
 static esp_codec_dev_handle_t s_play_dev = NULL;
 static int s_sample_rate = 16000;
 static int s_channels = 1;
+static SemaphoreHandle_t s_play_mutex = NULL;
+static volatile bool s_enabled = true;
+
+void app_sfx_set_enabled(bool enabled)
+{
+    s_enabled = enabled;
+}
+
+bool app_sfx_is_enabled(void)
+{
+    return s_enabled;
+}
 
 void app_sfx_set_play_dev(esp_codec_dev_handle_t play_dev, int sample_rate)
 {
+    if (s_play_mutex == NULL) {
+        s_play_mutex = xSemaphoreCreateMutex();
+    }
+    if (s_play_mutex != NULL) {
+        xSemaphoreTake(s_play_mutex, portMAX_DELAY);
+    }
+
     s_play_dev = play_dev;
     if (sample_rate > 0) {
         s_sample_rate = sample_rate;
     }
     /* The ES8389 play device is opened with 2 channels on this board. */
     s_channels = 2;
+
+    if (s_play_mutex != NULL) {
+        xSemaphoreGive(s_play_mutex);
+    }
+
 }
 
 static void play_tone(float freq, int ms, float vol)
 {
-    if (s_play_dev == NULL) {
+    if (s_play_mutex != NULL) {
+        xSemaphoreTake(s_play_mutex, portMAX_DELAY);
+    }
+    esp_codec_dev_handle_t current_play_dev = s_play_dev;
+    if (s_play_mutex != NULL) {
+        xSemaphoreGive(s_play_mutex);
+    }
+    if (current_play_dev == NULL) {
         return;
     }
+
     int n = (s_sample_rate * ms) / 1000;
     if (n <= 0) {
         return;
@@ -54,12 +84,25 @@ static void play_tone(float freq, int ms, float vol)
             buf[i * s_channels + c] = s;
         }
     }
-    esp_codec_dev_write(s_play_dev, buf, (int)bytes);
+    if (s_play_mutex != NULL) {
+        xSemaphoreTake(s_play_mutex, portMAX_DELAY);
+    }
+    esp_codec_dev_handle_t play_dev = s_play_dev;
+    if (play_dev != NULL) {
+        esp_codec_dev_write(play_dev, buf, (int)bytes);
+    }
+    if (s_play_mutex != NULL) {
+        xSemaphoreGive(s_play_mutex);
+    }
     free(buf);
 }
 
 void app_sfx_play(app_sfx_t sfx)
 {
+    if (!s_enabled && (sfx == APP_SFX_TAP || sfx == APP_SFX_PAGE)) {
+        return;
+    }
+
     switch (sfx) {
     case APP_SFX_TAP:
         play_tone(880.0f, 50, 0.12f);

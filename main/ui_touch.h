@@ -47,12 +47,12 @@ esp_err_t ui_touch_init(void);
 void ui_touch_set_callback(ui_touch_cb_t cb);
 
 /**
- * @brief  Read the current raw touch state (last polled). Used by the LVGL
+ * @brief  Read the current LVGL input-space touch state (last polled). Used by the LVGL
  *         pointer input device so LVGL widgets (buttons / sliders) respond to
  *         taps without a second driver reading the touch controller.
  *
- * @param[out] x        Touch X (or -1 when not pressed)
- * @param[out] y        Touch Y (or -1 when not pressed)
+ * @param[out] x        Last LVGL-space touch X (or -1 before the first sample)
+ * @param[out] y        Last LVGL-space touch Y (or -1 before the first sample)
  * @param[out] pressed  true while a finger is down
  */
 void ui_touch_get_pos(int *x, int *y, bool *pressed);

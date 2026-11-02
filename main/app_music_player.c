@@ -99,6 +99,24 @@ esp_err_t app_music_player_init(esp_codec_dev_handle_t play_dev, int sample_rate
     return ESP_OK;
 }
 
+esp_err_t app_music_player_deinit(void)
+{
+    if (s_player != NULL) {
+        esp_audio_simple_player_stop(s_player);
+        esp_gmf_err_t ret = esp_audio_simple_player_destroy(s_player);
+        s_player = NULL;
+        s_play_dev = NULL;
+        s_state = APP_MUSIC_STOPPED;
+        s_cur_url[0] = '\0';
+        return ret == ESP_GMF_ERR_OK ? ESP_OK : ESP_FAIL;
+    }
+
+    s_play_dev = NULL;
+    s_state = APP_MUSIC_STOPPED;
+    s_cur_url[0] = '\0';
+    return ESP_OK;
+}
+
 esp_err_t app_music_player_play(const char *url)
 {
     if (url == NULL || s_player == NULL) {

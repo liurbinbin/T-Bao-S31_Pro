@@ -18,6 +18,29 @@ CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+# Keep ordinary allocations larger than 4 KiB out of internal SRAM. With the
+# IDF default (16 KiB) malloc() kept filling the ~280 KiB internal heap until
+# only a few hundred bytes were left; the first wake then could not allocate
+# the 8 KiB WebSocket receive-task stack (ESP_ERR_NO_MEM) and the session died
+# before hello/audio were sent. Internal SRAM is needed by Wi-Fi DMA, task
+# stacks, WakeNet and LCD/PARLIO DMA.
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+# Keep a pool for MALLOC_CAP_INTERNAL requests (task stacks, DMA). A normal
+# malloc() can only fall back to it after the ordinary internal heap is gone.
+CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL=65536
+# Wi-Fi and lwIP buffers prefer PSRAM first; the internal DRAM stays available
+# for WakeNet, DMA descriptors and the WebSocket/TLS task stacks.
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# WebSocket transport task stack can live in PSRAM; the task control block
+# remains allocated from internal SRAM by FreeRTOS.
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
+
+# Offline face-following detector. Keep both model files in app Flash rodata so
+# the existing model SPIFFS partition and its label remain unchanged.
+CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
+CONFIG_HUMAN_FACE_DETECT_MSRMNP_S8_V1=y
+CONFIG_HUMAN_FACE_DETECT_MODEL_IN_FLASH_RODATA=y
 
 # S31 qacc (WakeNet/DSP) cannot access LP/RTC fast RAM (0x2E); keeping it out of
 # the MALLOC_CAP_INTERNAL heap forces SR activation buffers into internal SRAM
@@ -34,7 +57,30 @@ CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
 
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# Keep TLS handshake/record buffers in PSRAM so WakeNet, audio, and realtime
+# tasks retain enough internal SRAM for wakeup and WebSocket writes.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
+# TLS buffers live in PSRAM on this board. ESP32-S31 AES DMA then needs
+# internal MALLOC_CAP_DMA bounce buffers, which competes with audio/display
+# workloads and can abort TLS record decryption when the internal heap is low.
+# Keep TLS on the software AES path to avoid that hidden DMA allocation.
+# CONFIG_MBEDTLS_HARDWARE_AES is not set
+# CONFIG_MBEDTLS_HARDWARE_GCM is not set
+# The ESP hardware-SHA PSA driver allocates its hash context with
+# MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL on every psa_hash_setup(). Once a few
+# conversations had consumed the internal heap, mbedtls_ssl_setup() failed
+# with PSA_ERROR_INSUFFICIENT_MEMORY (-0x8D) and the device could no longer
+# reconnect/wake until reboot. Software SHA keeps the context inside the PSA
+# operation object (PSRAM) and needs no hidden internal DMA allocation.
+# CONFIG_MBEDTLS_HARDWARE_SHA is not set
+# CONFIG_MBEDTLS_AES_USE_INTERRUPT is not set
+# CONFIG_MBEDTLS_AES_HW_SMALL_DATA_LEN_OPTIM is not set
 CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
+# Keep incoming MCP/audio processing from contending with the microphone TX
+# path on the WebSocket client's receive lock.
+CONFIG_ESP_WS_CLIENT_SEPARATE_TX_LOCK=y
+CONFIG_ESP_WS_CLIENT_TX_LOCK_TIMEOUT_MS=2000
 CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_RX_IRAM_OPT=n
 CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUFFER=y
@@ -53,6 +99,16 @@ CONFIG_UART_ISR_IN_IRAM=y
 # LVGL 9.2.2
 # Enable LVGL adapter FS so EAF assets can be mounted (esp_lv_adapter_fs_mount)
 CONFIG_ESP_LVGL_ADAPTER_ENABLE_FS=y
+CONFIG_MMAP_FILE_NAME_LENGTH=32
+CONFIG_LV_DEF_REFR_PERIOD=10
+CONFIG_LV_USE_GIF=y
+
+# Use the ESP32-S31 PPA SRM hardware for LVGL software rotation.
+# CONFIG_LVGL_PORT_ENABLE_PPA=y
+
+# Keep the motion and servo tools in the first MCP response while limiting the
+# internal MCP response allocation on the memory-constrained S31.
+CONFIG_MCP_TOOLLIST_MAX_SIZE=8192
 
 CONFIG_LV_OS_NONE=y
 CONFIG_LV_USE_OS=0
@@ -69,6 +125,7 @@ CONFIG_LV_USE_FONT_PLACEHOLDER=y
 # Enable Chinese font support (Source Han Sans SC CJK)
 CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_14_CJK=y
 CONFIG_LV_FONT_DEFAULT_SOURCE_HAN_SANS_SC_14_CJK=y
+CONFIG_LV_FONT_MONTSERRAT_30=y
 
 # Disable extra widgets to save flash size
 CONFIG_LV_USE_ANIMIMG=n
@@ -109,6 +166,7 @@ CONFIG_TCP_SND_BUF_DEFAULT=8192
 CONFIG_EMOTE_DEF_SCROLL_SPEED=40
 CONFIG_EMOTE_DEF_LABEL_WIDTH=340
 CONFIG_EMOTE_DEF_LABEL_Y_OFFSET=268
+CONFIG_EMOTE_DEF_BG_COLOR=0x000000
 
 CONFIG_VOICE_WAKEUP_MODE=y
 CONFIG_AUDIO_AFE_ENABLE=y
@@ -120,12 +178,28 @@ CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
 # not in the bundle and fails the TLS handshake).
 CONFIG_XIAOZHI_CHAT_APP_TRANSPORT_WEBSOCKET=y
 
-# Camera: SC101IOT DVP (P1 FPC) + S31 hardware JPEG encoder (/dev/video10).
-CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT=y
-CONFIG_CAMERA_SC101IOT=y
-CONFIG_CAMERA_SC101IOT_AUTO_DETECT_DVP_INTERFACE_SENSOR=y
-CONFIG_CAMERA_XCLK_USE_LEDC=y
-CONFIG_ESP_VIDEO_ENABLE_HW_JPEG_ENC_VIDEO_DEVICE=y
+# Keep the long-lived audio input task stack out of scarce internal SRAM.
+# The dynamic path is required for PSRAM-backed task stacks.
+# CONFIG_XIAOZHI_AUDIO_TASK_ALLOC_STATIC is not set
+CONFIG_XIAOZHI_AUDIO_TASK_ALLOC_DYNAMIC=y
+CONFIG_XIAOZHI_STACK_IN_PSRAM=y
+
+# Camera: T-Bao S31 PARLIO JPEG capture with OV2640/OV3660 compatibility.
+CONFIG_ESP_BOARD_DEV_CAMERA_SUPPORT=n
+CONFIG_TBAO_CAMERA_SUPPORT=y
+CONFIG_TBAO_CAMERA_OV3660=n
+CONFIG_TBAO_CAMERA_OV2640_CORE_1V3=n
+CONFIG_ESP_CAM_IO_PARL_OV2640=y
+CONFIG_ESP_CAM_IO_PARL_OV3660=y
+CONFIG_ESP_CAM_IO_PARL_OV5640=n
+CONFIG_ESP_CAM_IO_PARL_NT99141=n
+CONFIG_ESP_CAM_IO_PARL_FRAME_SIZE_AUTO=y
+CONFIG_ESP_CAM_IO_PARL_FRAME_SIZE_MUL=1
+CONFIG_ESP_CAM_IO_PARL_FRAME_SIZE_DIV=2
+CONFIG_ESP_CAM_IO_PARL_FRAME_SIZE_PADDING=8192
+CONFIG_ESP_CAM_IO_PARL_SCCB_I2C_PORT1=y
+CONFIG_ESP_CAM_IO_PARL_SCCB_I2C_PORT0=n
+CONFIG_ESP_CAM_IO_PARL_PAYLOAD_SIZE=16384
 
 # Wi-Fi (protocol_examples_common)
 CONFIG_EXAMPLE_WIFI_SSID="HONOR"

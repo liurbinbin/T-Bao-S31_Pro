@@ -1,113 +1,135 @@
-/*
- * SPDX-License-Identifier: Apache-2.0
- *
- * PPA-based on-screen camera preview (see app_camera_preview.h).
- *
- * Uses the ESP32-S31 Pixel Processing Accelerator (PPA) SRM engine to convert
- * the DVP's native 1280x720 UYVY stream into a small RGB565 preview with
- * bilinear scaling — all in hardware, no CPU, no software JPEG decode.
- *
- * Reference: esp-vision's camera_lcd_preview example follows the same
- * "native YUV -> PPA -> RGB565 -> LCD" pipeline.
- */
+/* Decode a 320x320 camera JPEG into RGB565 with the S31 JPEG engine. */
 #include "app_camera_preview.h"
 
-#include <string.h>
+#include "driver/jpeg_decode.h"
 #include "esp_log.h"
-#include "driver/ppa.h"
-#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "CAM_PREVIEW";
 
-static ppa_client_handle_t s_srm = NULL;
-static bool s_inited = false;
+static SemaphoreHandle_t s_mutex;
+static StaticSemaphore_t s_mutex_storage;
+static portMUX_TYPE s_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
+static jpeg_decoder_handle_t s_decoder;
+static jpeg_decode_cfg_t s_decode_config;
+static bool s_inited;
+static esp_err_t s_last_init_error = ESP_OK;
+static TickType_t s_retry_after;
+
+static SemaphoreHandle_t get_mutex(void)
+{
+    /* The preview is shared by the camera page, guard mode, and face follow.
+     * Create the lock without consuming heap and publish it atomically. */
+    portENTER_CRITICAL(&s_mutex_init_lock);
+    if (s_mutex == NULL) {
+        s_mutex = xSemaphoreCreateMutexStatic(&s_mutex_storage);
+    }
+    SemaphoreHandle_t mutex = s_mutex;
+    portEXIT_CRITICAL(&s_mutex_init_lock);
+    return mutex;
+}
 
 esp_err_t app_camera_preview_init(void)
 {
+    SemaphoreHandle_t mutex = get_mutex();
+    if (mutex == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
     if (s_inited) {
+        xSemaphoreGive(mutex);
         return ESP_OK;
     }
-    ppa_client_config_t cfg = {
-        .oper_type = PPA_OPERATION_SRM,
-        .max_pending_trans_num = 1,
-        .data_burst_length = PPA_DATA_BURST_LENGTH_128,
-    };
-    esp_err_t ret = ppa_register_client(&cfg, &s_srm);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "ppa_register_client failed: %s", esp_err_to_name(ret));
+
+    TickType_t now = xTaskGetTickCount();
+    if (s_last_init_error != ESP_OK &&
+        (int32_t)(now - s_retry_after) < 0) {
+        esp_err_t ret = s_last_init_error;
+        xSemaphoreGive(mutex);
         return ret;
     }
+
+    jpeg_decode_engine_cfg_t engine_config = {
+        .intr_priority = 0,
+        .timeout_ms = 80,
+    };
+    s_decoder = NULL;
+    esp_err_t ret = jpeg_new_decoder_engine(&engine_config, &s_decoder);
+    if (ret != ESP_OK) {
+        s_decoder = NULL;
+        s_last_init_error = ret;
+        s_retry_after = now + pdMS_TO_TICKS(200);
+        ESP_LOGE(TAG, "create JPEG decoder failed: %s", esp_err_to_name(ret));
+        xSemaphoreGive(mutex);
+        return ret;
+    }
+    s_decode_config = (jpeg_decode_cfg_t) {
+        .output_format = JPEG_DECODE_OUT_FORMAT_RGB565,
+        .rgb_order = JPEG_DEC_RGB_ELEMENT_ORDER_BGR,
+        .conv_std = JPEG_YUV_RGB_CONV_STD_BT601,
+    };
     s_inited = true;
-    ESP_LOGI(TAG, "PPA SRM client ready (UYVY->RGB565 %dx%d)",
-             CAM_PREVIEW_W, CAM_PREVIEW_H);
+    s_last_init_error = ESP_OK;
+    s_retry_after = 0;
+    ESP_LOGI(TAG, "hardware JPEG decoder ready for %dx%d RGB565", CAM_PREVIEW_W, CAM_PREVIEW_H);
+    xSemaphoreGive(mutex);
     return ESP_OK;
 }
 
-esp_err_t app_camera_preview_process(const uint8_t *yuv, int w, int h, uint8_t *out)
+esp_err_t app_camera_preview_process(const uint8_t *jpeg, size_t jpeg_len, uint8_t *out_rgb565)
 {
-    if (!s_inited || yuv == NULL || out == NULL || w <= 0 || h <= 0) {
+    if (jpeg == NULL || jpeg_len == 0 || out_rgb565 == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t ret = app_camera_preview_init();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    SemaphoreHandle_t mutex = get_mutex();
+    if (mutex == NULL || xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (!s_inited || s_decoder == NULL) {
+        xSemaphoreGive(mutex);
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Keep the 16:9 (1280x720) source from being stretched into the square
-     * 240x240 preview: centre-crop a square region of the source and scale
-     * THAT, so people/objects keep correct proportions (no egg-head effect). */
-    uint32_t src_w = (uint32_t)w;
-    uint32_t src_h = (uint32_t)h;
-    uint32_t crop = (src_w < src_h) ? src_w : src_h;          /* square crop side */
-    uint32_t crop_x = (src_w - crop) / 2;                     /* centre horizontally */
-    uint32_t crop_y = (src_h - crop) / 2;                     /* centre vertically */
-    /* PPA source block must be even (UYVY 2 bytes/px); 720x720 crop is fine. */
-
-    ppa_srm_oper_config_t srm = {
-        .in = {
-            .buffer = yuv,
-            .pic_w = src_w,
-            .pic_h = src_h,
-            .block_w = crop,
-            .block_h = crop,
-            .block_offset_x = crop_x,
-            .block_offset_y = crop_y,
-            .srm_cm = PPA_SRM_COLOR_MODE_YUV422_UYVY,
-            .yuv_range = PPA_COLOR_RANGE_LIMIT,
-            .yuv_std = PPA_COLOR_CONV_STD_RGB_YUV_BT601,
-        },
-        .out = {
-            .buffer = out,
-            .buffer_size = (uint32_t)(CAM_PREVIEW_W * CAM_PREVIEW_H * 2),
-            .pic_w = CAM_PREVIEW_W,
-            .pic_h = CAM_PREVIEW_H,
-            .block_offset_x = 0,
-            .block_offset_y = 0,
-            .srm_cm = PPA_SRM_COLOR_MODE_RGB565,
-        },
-        .rotation_angle = PPA_SRM_ROTATION_ANGLE_0,
-        .scale_x = (float)CAM_PREVIEW_W / (float)crop,
-        .scale_y = (float)CAM_PREVIEW_H / (float)crop,
-        .mirror_x = false,
-        .mirror_y = false,
-        .rgb_swap = false,
-        .byte_swap = false,
-        .alpha_update_mode = PPA_ALPHA_NO_CHANGE,
-        .mode = PPA_TRANS_MODE_BLOCKING,
-        .user_data = NULL,
-    };
-
-    esp_err_t ret = ppa_do_scale_rotate_mirror(s_srm, &srm);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "ppa_do_srm failed: %s", esp_err_to_name(ret));
-        return ret;
+    jpeg_decode_picture_info_t picture_info = {0};
+    ret = jpeg_decoder_get_info(jpeg, (uint32_t)jpeg_len, &picture_info);
+    if (ret == ESP_OK &&
+        (picture_info.width != CAM_PREVIEW_W || picture_info.height != CAM_PREVIEW_H)) {
+        ret = ESP_ERR_INVALID_SIZE;
     }
-    return ESP_OK;
+    uint32_t output_size = 0;
+    if (ret == ESP_OK) {
+        ret = jpeg_decoder_process(s_decoder, &s_decode_config, jpeg, (uint32_t)jpeg_len,
+                                   out_rgb565, CAM_PREVIEW_BYTES, &output_size);
+    }
+    if (ret == ESP_OK && output_size != CAM_PREVIEW_BYTES) {
+        ret = ESP_ERR_INVALID_SIZE;
+    }
+    xSemaphoreGive(mutex);
+    return ret;
 }
 
 void app_camera_preview_deinit(void)
 {
-    /* Keep the PPA client registered for the lifetime of the app: registering /
-     * unregistering on every camera-page enter/exit repeatedly allocated and
-     * freed internal RAM (the S31 has only ~62KB internal RAM free at runtime;
-     * churn made allocation fail under memory pressure -> crashes over time).
-     * The client is tiny and reused across page visits. */
-    (void)s_srm;
-    (void)s_inited;
+    SemaphoreHandle_t mutex = get_mutex();
+    if (mutex == NULL || xSemaphoreTake(mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    if (s_decoder != NULL) {
+        (void)jpeg_del_decoder_engine(s_decoder);
+        s_decoder = NULL;
+    }
+    s_inited = false;
+    s_last_init_error = ESP_OK;
+    s_retry_after = 0;
+    xSemaphoreGive(mutex);
 }

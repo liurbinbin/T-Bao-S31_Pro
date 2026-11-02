@@ -13,7 +13,9 @@
 #include "font_awesome_symbols.h"
 #include "font_emoji.h"
 #include "expression_emote.h"
+#include "widget/gfx_anim.h"
 #include "ui_page_manager.h"
+#include "app_language.h"
 
 #include <esp_err.h>
 #include <esp_check.h>
@@ -22,12 +24,19 @@
 #include <esp_lvgl_port.h>
 #include <esp_pm.h>
 #include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_partition.h>
+#include <esp_random.h>
 #include <esp_timer.h>
+#include <inttypes.h>
 #include <lvgl.h>
+#include "src/display/lv_display_private.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 
 /* LVGL pointer input read callback (defined below) mirrors ui_touch's state. */
@@ -45,6 +54,12 @@ void lvgl_port_touch_mirror_read(lv_indev_t *indev, lv_indev_data_t *data);
 #define DARK_SYSTEM_TEXT_COLOR          lv_color_hex(0xAAAAAA)
 #define DARK_BORDER_COLOR               lv_color_hex(0x333333)
 #define DARK_LOW_BATTERY_COLOR          lv_color_hex(0xFF0000)
+
+#if CONFIG_ESP_BOARD_TBAO_S31_BOARD
+#define TBAO_LCD_SW_ROTATE              1
+#else
+#define TBAO_LCD_SW_ROTATE              0
+#endif
 
 #define LIGHT_BACKGROUND_COLOR          lv_color_white()
 #define LIGHT_TEXT_COLOR                lv_color_black()
@@ -99,6 +114,10 @@ typedef struct display {
     lv_obj_t *low_battery_popup;
     lv_obj_t *low_battery_label;
     const char *battery_icon;
+    int battery_percent;
+    bool battery_valid;
+    bool battery_charging;
+    bool low_battery_warning_visible;
     const char *network_icon;
     bool muted;
     char current_theme_name[32];
@@ -116,6 +135,14 @@ typedef struct {
     lv_obj_t *preview_image;
     display_fonts_t fonts;
     theme_colors_t current_theme;
+    struct {
+        uint32_t refresh_count;
+        uint32_t flush_count;
+        uint64_t pixels;
+        uint64_t wait_us;
+        int64_t wait_start_us;
+        int64_t window_start_us;
+    } perf;
 } lcd_display_t;
 
 static const char *TAG = "ESP_XIAOZHI_CHAT_DISPLAY";
@@ -131,25 +158,13 @@ static const struct {
 } s_emotion_table[] = {
     {"neutral", FONT_AWESOME_EMOJI_NEUTRAL, "😶"},
     {"happy", FONT_AWESOME_EMOJI_HAPPY, "🙂"},
-    {"laughing", FONT_AWESOME_EMOJI_LAUGHING, "😆"},
-    {"funny", FONT_AWESOME_EMOJI_FUNNY, "😂"},
     {"sad", FONT_AWESOME_EMOJI_SAD, "😔"},
-    {"angry", FONT_AWESOME_EMOJI_ANGRY, "😠"},
     {"crying", FONT_AWESOME_EMOJI_CRYING, "😭"},
-    {"loving", FONT_AWESOME_EMOJI_LOVING, "😍"},
-    {"embarrassed", FONT_AWESOME_EMOJI_EMBARRASSED, "😳"},
-    {"surprised", FONT_AWESOME_EMOJI_SURPRISED, "😯"},
-    {"shocked", FONT_AWESOME_EMOJI_SHOCKED, "😱"},
-    {"thinking", FONT_AWESOME_EMOJI_THINKING, "🤔"},
-    {"winking", FONT_AWESOME_EMOJI_WINKING, "😉"},
-    {"cool", FONT_AWESOME_EMOJI_COOL, "😎"},
-    {"relaxed", FONT_AWESOME_EMOJI_RELAXED, "😌"},
-    {"delicious", FONT_AWESOME_EMOJI_DELICIOUS, "🤤"},
-    {"kissy", FONT_AWESOME_EMOJI_KISSY, "😘"},
-    {"confident", FONT_AWESOME_EMOJI_CONFIDENT, "😏"},
     {"sleepy", FONT_AWESOME_EMOJI_SLEEPY, "😴"},
-    {"silly", FONT_AWESOME_EMOJI_SILLY, "😜"},
+    {"angry", FONT_AWESOME_EMOJI_ANGRY, "😠"},
+    {"shocked", FONT_AWESOME_EMOJI_SHOCKED, "😱"},
     {"confused", FONT_AWESOME_EMOJI_CONFUSED, "🙄"},
+    {"winking", FONT_AWESOME_EMOJI_WINKING, "😉"},
 };
 #define EMOTION_COUNT (sizeof(s_emotion_table) / sizeof(s_emotion_table[0]))
 
@@ -160,9 +175,38 @@ static const struct {
  * the LVGL display keeps working as a graceful fallback. */
 static emote_handle_t s_emote = NULL;
 static bool s_emote_active = false;
+static bool s_emote_idle = false;
+static int s_emote_current_index = 0;
+static portMUX_TYPE s_emote_state_lock = portMUX_INITIALIZER_UNLOCKED;
+/* Serialize high-level emote commands issued by chat, touch, timers, and
+ * battery/status callbacks. The gfx layer has its own lock, but compound
+ * commands (for example animation + dialog timer) still need one owner. */
+static SemaphoreHandle_t s_emote_api_mutex = NULL;
+/* Last eye animation requested through set_emotion(); used to resume it when
+ * the face page becomes visible again after a PAGE had the panel. */
+static const char *s_last_eye_anim = "neutral";
+#define EMOTE_API_LOCK_TIMEOUT_MS 1000
 /* True while the animated face is the active panel renderer. When false the
  * LVGL page UI owns the panel (see esp_xiaozhi_chat_display_set_face_visible). */
 static bool s_face_visible = false;
+static bool s_face_accept_flush = false;
+typedef enum {
+    PANEL_FLUSH_OWNER_NONE = 0,
+    PANEL_FLUSH_OWNER_LVGL,
+    PANEL_FLUSH_OWNER_EMOTE,
+    PANEL_FLUSH_OWNER_VIDEO,
+} panel_flush_owner_t;
+
+static volatile panel_flush_owner_t s_panel_flush_owner = PANEL_FLUSH_OWNER_NONE;
+static portMUX_TYPE s_panel_flush_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint16_t *s_emote_rotate_buffer = NULL;
+static size_t s_emote_rotate_buffer_pixels = 0;
+static int s_emote_display_height = 0;
+static uint16_t *s_video_rotate_buffer = NULL;
+static size_t s_video_rotate_buffer_pixels = 0;
+static SemaphoreHandle_t s_video_flush_sem = NULL;
+static bool s_video_visible = false;
+static bool s_video_accept_flush = false;
 /* LVGL container reused by every PAGE-mode page (dialogue / camera / ...). */
 static lv_obj_t *s_page_root = NULL;
 
@@ -171,47 +215,42 @@ typedef struct {
     const char *anim;
 } emote_map_t;
 
-/* Maps the app's emotion names to the .eaf animation names that actually exist
- * in the flashed emote asset pack (emote-assets1.bin -> emote_assets_mmap.bin).
- * Only names with a backing .eaf file are valid here; the pack also lists
- * "smile_static" / "snigger_10s" / "yummy_20_s" entries whose .eaf files are
- * absent, so referencing them makes emote_set_anim_emoji() fail to load. */
+/* Maps app emotion names to entries in the bundled 360x360 asset pack. */
 static const emote_map_t s_emote_map[] = {
-    {"neutral",     "smile_05s"},
-    {"happy",       "smile_05s"},
-    {"laughing",    "laugh_05s_10"},
-    {"funny",       "laugh_05s_10"},
-    {"sad",         "sad_05s15s"},
-    {"angry",       "angry_20s"},
-    {"crying",      "cry_10s_20s"},
-    {"loving",      "shy_20s_40s"},
-    {"embarrassed", "shy_20s_40s"},
-    {"surprised",   "shocked_05s_"},
-    {"shocked",     "shocked_05s_"},
-    {"thinking",    "ponder_05s"},
-    {"winking",     "question_05s"},
-    {"cool",        "confident_08"},
-    {"relaxed",     "leisure_05s_"},
-    {"delicious",   "leisure_05s_"},
-    {"kissy",       "shy_20s_40s"},
-    {"confident",   "confident_08"},
-    {"sleepy",      "asleep_215s"},
-    {"silly",       "mock_05s"},
-    {"confused",    "question_05s"},
+    {"neutral",     "neutral"},
+    {"happy",       "happy"},
+    {"sad",         "sad"},
+    {"crying",      "crying"},
+    {"sleepy",      "sleepy"},
+    {"angry",       "angry"},
+    {"shocked",     "shocked"},
+    {"confused",    "confused"},
+    {"winking",     "winking"},
 };
 #define EMOTE_MAP_COUNT (sizeof(s_emote_map) / sizeof(s_emote_map[0]))
 
-static const char *emote_anim_for(const char *emotion)
+static size_t emote_index_for(const char *emotion)
 {
-    if (emotion == NULL) {
-        return "smile_05s";
-    }
-    for (size_t i = 0; i < EMOTE_MAP_COUNT; ++i) {
-        if (strcmp(s_emote_map[i].emotion, emotion) == 0) {
-            return s_emote_map[i].anim;
+    if (emotion != NULL) {
+        for (size_t i = 0; i < EMOTE_MAP_COUNT; ++i) {
+            if (strcmp(s_emote_map[i].emotion, emotion) == 0) {
+                return i;
+            }
         }
     }
-    return "smile_05s";
+    return 0;
+}
+
+static const char *emote_anim_for(const char *emotion)
+{
+    return s_emote_map[emote_index_for(emotion)].anim;
+}
+
+static void emote_record_current_index(size_t index)
+{
+    portENTER_CRITICAL(&s_emote_state_lock);
+    s_emote_current_index = (int)index;
+    portEXIT_CRITICAL(&s_emote_state_lock);
 }
 
 /* Forward declarations: LVGL-port lock/unlock helpers (defined further below)
@@ -219,21 +258,204 @@ static const char *emote_anim_for(const char *emotion)
 static bool esp_xiaozhi_chat_display_lock(display_t *disp, int timeout_ms);
 static void esp_xiaozhi_chat_display_unlock(display_t *disp);
 
+static bool emote_api_lock(const char *operation)
+{
+    if (s_emote_api_mutex == NULL) {
+        ESP_LOGW(TAG, "emote API mutex unavailable for %s",
+                 operation != NULL ? operation : "operation");
+        return false;
+    }
+    if (xSemaphoreTake(s_emote_api_mutex,
+                       pdMS_TO_TICKS(EMOTE_API_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "timed out waiting for emote API mutex (%s)",
+                 operation != NULL ? operation : "operation");
+        return false;
+    }
+    return true;
+}
+
+static void emote_api_unlock(void)
+{
+    if (s_emote_api_mutex != NULL) {
+        xSemaphoreGive(s_emote_api_mutex);
+    }
+}
+
+/* The eye animation is the emote's only continuously running animation.  When
+ * a PAGE owns the panel (camera, launcher, settings, ...) the emote's output is
+ * discarded, but its render task still decodes and draws a full 360x360 frame
+ * at the animation rate.  Stopping it while hidden frees that CPU for the
+ * page, which is what made the camera preview (and any LVGL animation) feel
+ * sluggish whenever the AI face was active in the background. */
+static void emote_set_eye_anim_running(bool running)
+{
+    if (!s_emote_active || s_emote == NULL) {
+        return;
+    }
+    if (!emote_api_lock(running ? "eye anim start" : "eye anim stop")) {
+        return;
+    }
+    if (running) {
+        /* Use the emote API rather than gfx_anim_start(): it takes the gfx
+         * render lock before touching the animation. */
+        (void)emote_set_anim_emoji(s_emote, s_last_eye_anim);
+    } else {
+        gfx_obj_t *eye = emote_get_obj_by_name(s_emote, EMT_DEF_ELEM_EYE_ANIM);
+        if (eye != NULL) {
+            (void)gfx_anim_stop(eye);
+        }
+    }
+    emote_api_unlock();
+}
+
+static void emote_on_update(gfx_disp_event_t event, const void *obj, emote_handle_t manager)
+{
+    (void)obj;
+
+    if (manager == NULL ||
+        (event != GFX_DISP_EVENT_ONE_FRAME_DONE &&
+         event != GFX_DISP_EVENT_PART_FRAME_DONE &&
+         event != GFX_DISP_EVENT_ALL_FRAME_DONE)) {
+        return;
+    }
+
+    bool refresh_face;
+    portENTER_CRITICAL(&s_panel_flush_lock);
+    refresh_face = s_face_visible && s_face_accept_flush;
+    portEXIT_CRITICAL(&s_panel_flush_lock);
+    if (refresh_face) {
+        /* The emote renderer normally invalidates only the animated object's
+         * rectangle. Mark the whole canvas dirty so the next flush contains
+         * one complete frame, including the black background. This callback
+         * runs on the emote renderer task, so never block behind a business
+         * command; a busy mutex simply defers the refresh to the next frame. */
+        if (s_emote_api_mutex != NULL &&
+            xSemaphoreTake(s_emote_api_mutex, 0) == pdTRUE) {
+            emote_notify_all_refresh(manager);
+            xSemaphoreGive(s_emote_api_mutex);
+        }
+    }
+}
+
 static void emote_set_status_event(const char *status)
 {
     if (s_emote == NULL || status == NULL) {
         return;
     }
+
+    if (!emote_api_lock("status")) {
+        return;
+    }
+
+    const bool idle = strncmp(status, "Ready", 5) == 0 ||
+                      strncmp(status, "Connected", 9) == 0 ||
+                      strncmp(status, "Disconnected", 12) == 0 ||
+                      strncmp(status, "AI Disabled", 11) == 0;
+    portENTER_CRITICAL(&s_emote_state_lock);
+    s_emote_idle = idle;
+    portEXIT_CRITICAL(&s_emote_state_lock);
+
     if (strncmp(status, "Listening", 8) == 0) {
         emote_set_event_msg(s_emote, EMOTE_MGR_EVT_LISTEN, NULL);
     } else if (strncmp(status, "Speaking", 8) == 0) {
         emote_set_event_msg(s_emote, EMOTE_MGR_EVT_SPEAK, NULL);
     } else if (strncmp(status, "Ready", 5) == 0 ||
                strncmp(status, "Connected", 9) == 0 ||
-               strncmp(status, "Disconnected", 12) == 0) {
-        emote_set_event_msg(s_emote, EMOTE_MGR_EVT_IDLE, NULL);
+               strncmp(status, "Disconnected", 12) == 0 ||
+               strncmp(status, "AI Disabled", 11) == 0) {
+        emote_set_event_msg(s_emote, EMOTE_MGR_EVT_OFF, NULL);
     } else {
         emote_set_event_msg(s_emote, EMOTE_MGR_EVT_SET, NULL);
+    }
+    emote_api_unlock();
+}
+
+static bool emote_assets_partition_valid(void)
+{
+    const esp_partition_t *partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, "assets");
+    if (partition == NULL) {
+        ESP_LOGW(TAG, "emote: assets partition is missing");
+        return false;
+    }
+
+    uint32_t stored_files = 0;
+    uint32_t stored_checksum = 0;
+    uint32_t stored_len = 0;
+    esp_err_t ret = esp_partition_read(partition, 0, &stored_files, sizeof(stored_files));
+    ret |= esp_partition_read(partition, 4, &stored_checksum, sizeof(stored_checksum));
+    ret |= esp_partition_read(partition, 8, &stored_len, sizeof(stored_len));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "emote: cannot read assets header: %s", esp_err_to_name(ret));
+        return false;
+    }
+
+    const uint64_t table_min_len = (uint64_t)stored_files * (CONFIG_MMAP_FILE_NAME_LENGTH + 12U);
+    const uint64_t table_max_len = partition->size - 12U;
+    if (stored_files == 0 || stored_files > 256 ||
+        table_min_len > stored_len || stored_len > table_max_len) {
+        ESP_LOGW(TAG, "emote: invalid assets header files=%" PRIu32 " len=%" PRIu32,
+                 stored_files, stored_len);
+        return false;
+    }
+
+    (void)stored_checksum;
+    return true;
+}
+
+static void emote_release_rotate_buffer(void)
+{
+    if (s_emote_rotate_buffer != NULL) {
+        heap_caps_free(s_emote_rotate_buffer);
+        s_emote_rotate_buffer = NULL;
+        s_emote_rotate_buffer_pixels = 0;
+    }
+}
+
+static esp_err_t emote_prepare_rotate_buffer(int width, int height)
+{
+    const size_t pixels = (size_t)width * height;
+    const size_t bytes = pixels * sizeof(uint16_t);
+
+    if (s_emote_rotate_buffer != NULL && s_emote_rotate_buffer_pixels >= pixels) {
+        return ESP_OK;
+    }
+
+    emote_release_rotate_buffer();
+    s_emote_rotate_buffer = (uint16_t *)heap_caps_aligned_alloc(
+        64, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_emote_rotate_buffer == NULL) {
+        s_emote_rotate_buffer = (uint16_t *)heap_caps_aligned_alloc(
+            64, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (s_emote_rotate_buffer == NULL) {
+        ESP_LOGE(TAG, "emote: rotate buffer allocation failed (%zu bytes)", bytes);
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_emote_rotate_buffer_pixels = pixels;
+    return ESP_OK;
+}
+
+static void panel_wait_for_flush_idle(void)
+{
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(1000);
+
+    while (true) {
+        panel_flush_owner_t owner;
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        owner = s_panel_flush_owner;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+
+        if (owner == PANEL_FLUSH_OWNER_NONE) {
+            return;
+        }
+        if ((xTaskGetTickCount() - start) >= timeout) {
+            ESP_LOGW(TAG, "LCD flush owner did not become idle within 1000 ms (%d)", owner);
+            return;
+        }
+        vTaskDelay(1);
     }
 }
 
@@ -241,11 +463,72 @@ static void emote_on_flush_ready(int x_start, int y_start, int x_end, int y_end,
                                  const void *data, emote_handle_t handle)
 {
     esp_lcd_panel_handle_t panel = (esp_lcd_panel_handle_t)emote_get_user_data(handle);
-    if (panel != NULL && s_face_visible) {
-        esp_lcd_panel_draw_bitmap(panel, x_start, y_start, x_end, y_end, data);
-    } else {
+    bool accept_flush;
+    portENTER_CRITICAL(&s_panel_flush_lock);
+    accept_flush = panel != NULL && s_face_visible && s_face_accept_flush &&
+                   s_panel_flush_owner == PANEL_FLUSH_OWNER_NONE;
+    if (accept_flush) {
+        s_panel_flush_owner = PANEL_FLUSH_OWNER_EMOTE;
+    }
+    portEXIT_CRITICAL(&s_panel_flush_lock);
+
+    if (!accept_flush) {
         /* Face hidden: LVGL owns the panel, so we must not draw over it. Notify
          * completion ourselves so emote's internal flush wait never deadlocks. */
+        emote_notify_flush_finished(handle);
+        return;
+    }
+
+    if (data == NULL || x_end <= x_start || y_end <= y_start) {
+        ESP_LOGW(TAG, "emote: invalid flush area (%d,%d)-(%d,%d)",
+                 x_start, y_start, x_end, y_end);
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_panel_flush_owner = PANEL_FLUSH_OWNER_NONE;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+        emote_notify_flush_finished(handle);
+        return;
+    }
+
+    const int src_width = x_end - x_start;
+    const int src_height = y_end - y_start;
+    const size_t pixels = (size_t)src_width * src_height;
+    const void *flush_data = data;
+    int flush_x_start = x_start;
+    int flush_y_start = y_start;
+    int flush_x_end = x_end;
+    int flush_y_end = y_end;
+
+#if CONFIG_ESP_BOARD_TBAO_S31_BOARD
+    /* The LCD stays in its stable page-mode orientation (MX=1). Reproduce the
+     * former face-mode MADCTL transform in the frame so PAGE and FACE can share
+     * the PARLIO panel without changing MADCTL while a transfer is queued. */
+    if (s_emote_rotate_buffer == NULL || pixels > s_emote_rotate_buffer_pixels) {
+        ESP_LOGE(TAG, "emote: rotate buffer too small for %dx%d flush", src_width, src_height);
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_panel_flush_owner = PANEL_FLUSH_OWNER_NONE;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+        emote_notify_flush_finished(handle);
+        return;
+    }
+    lv_draw_sw_rotate(data, s_emote_rotate_buffer,
+                      src_width, src_height,
+                      src_width * (int)sizeof(uint16_t),
+                      src_height * (int)sizeof(uint16_t),
+                      LV_DISPLAY_ROTATION_270, LV_COLOR_FORMAT_RGB565);
+    flush_data = s_emote_rotate_buffer;
+    flush_x_start = s_emote_display_height - y_end;
+    flush_y_start = x_start;
+    flush_x_end = s_emote_display_height - y_start;
+    flush_y_end = x_end;
+#endif
+
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(panel, flush_x_start, flush_y_start,
+                                               flush_x_end, flush_y_end, flush_data);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "emote: draw bitmap failed: %s", esp_err_to_name(ret));
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_panel_flush_owner = PANEL_FLUSH_OWNER_NONE;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
         emote_notify_flush_finished(handle);
     }
 }
@@ -263,13 +546,39 @@ static bool emote_on_flush_done(const esp_lcd_panel_io_handle_t panel_io,
      *    never blocks forever on a flush (previously emote overwrote the LVGL
      *    callback and switching back to a page only drew the first block, then
      *    everything froze). */
-    if (s_face_visible) {
+    panel_flush_owner_t owner;
+    portENTER_CRITICAL_ISR(&s_panel_flush_lock);
+    owner = s_panel_flush_owner;
+    s_panel_flush_owner = PANEL_FLUSH_OWNER_NONE;
+    portEXIT_CRITICAL_ISR(&s_panel_flush_lock);
+
+    switch (owner) {
+    case PANEL_FLUSH_OWNER_EMOTE: {
         emote_handle_t handle = (emote_handle_t)user_ctx;
         if (handle) {
             emote_notify_flush_finished(handle);
         }
-    } else if (s_display != NULL && s_display->lv_disp != NULL) {
-        lv_disp_flush_ready(s_display->lv_disp);
+        break;
+    }
+    case PANEL_FLUSH_OWNER_LVGL:
+        if (s_display != NULL && s_display->lv_disp != NULL) {
+            lv_disp_flush_ready(s_display->lv_disp);
+        }
+        break;
+    case PANEL_FLUSH_OWNER_VIDEO:
+        if (s_video_flush_sem != NULL) {
+            if (xPortInIsrContext() == pdTRUE) {
+                BaseType_t higher_priority_task_woken = pdFALSE;
+                xSemaphoreGiveFromISR(s_video_flush_sem,
+                                      &higher_priority_task_woken);
+                return higher_priority_task_woken == pdTRUE;
+            }
+            xSemaphoreGive(s_video_flush_sem);
+        }
+        break;
+    case PANEL_FLUSH_OWNER_NONE:
+    default:
+        break;
     }
     return true;
 }
@@ -295,9 +604,21 @@ esp_err_t esp_xiaozhi_chat_display_enable_emote(void)
         ESP_LOGW(TAG, "emote: LCD io/panel handles NULL");
         return ESP_ERR_INVALID_STATE;
     }
+    if (!emote_assets_partition_valid()) {
+        ESP_LOGW(TAG, "emote: assets unavailable; keeping LVGL display");
+        return ESP_ERR_NOT_FOUND;
+    }
 
     const int w = s_display->width;
     const int h = s_display->height;
+    s_emote_display_height = h;
+
+#if CONFIG_ESP_BOARD_TBAO_S31_BOARD
+    ret = emote_prepare_rotate_buffer(w, h);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+#endif
 
     emote_config_t cfg = {
         .flags = {
@@ -312,7 +633,7 @@ esp_err_t esp_xiaozhi_chat_display_enable_emote(void)
             .fps = 25,
         },
         .buffers = {
-            .buf_pixels = (size_t)(w * 16),
+            .buf_pixels = (size_t)(w * h),
         },
         .task = {
             .task_priority = 5,
@@ -321,12 +642,20 @@ esp_err_t esp_xiaozhi_chat_display_enable_emote(void)
             .task_stack_in_ext = true,   /* keep the 6KB stack out of internal SRAM */
         },
         .flush_cb = emote_on_flush_ready,
+        .update_cb = emote_on_update,
         .user_data = (void *)lcd_handles->panel_handle,
     };
+
+    if (!emote_api_lock("init")) {
+        emote_release_rotate_buffer();
+        return ESP_ERR_TIMEOUT;
+    }
 
     s_emote = emote_init(&cfg);
     if (s_emote == NULL) {
         ESP_LOGE(TAG, "emote_init failed; keeping LVGL display");
+        emote_api_unlock();
+        emote_release_rotate_buffer();
         return ESP_FAIL;
     }
 
@@ -340,8 +669,11 @@ esp_err_t esp_xiaozhi_chat_display_enable_emote(void)
         ESP_LOGE(TAG, "emote mount+load failed (%s); keeping LVGL display", esp_err_to_name(ret));
         emote_deinit(s_emote);
         s_emote = NULL;
+        emote_api_unlock();
+        emote_release_rotate_buffer();
         return ret;
     }
+    emote_api_unlock();
 
     const esp_lcd_panel_io_callbacks_t cbs = {
         .on_color_trans_done = emote_on_flush_done,
@@ -349,14 +681,26 @@ esp_err_t esp_xiaozhi_chat_display_enable_emote(void)
     esp_lcd_panel_io_register_event_callbacks(lcd_handles->io_handle, &cbs, s_emote);
 
     s_emote_active = true;
-    /* The animated face now owns the panel. Switch the renderer into FACE mode
-     * (stops LVGL flushing; keeps its objects alive for PAGE-mode pages). */
-    esp_xiaozhi_chat_display_set_face_visible(true);
-
     ESP_LOGI(TAG, "Emote display active (%dx%d)", w, h);
-    emote_set_anim_emoji(s_emote, "smile_05s");
+    if (emote_api_lock("enable animation")) {
+        (void)emote_set_anim_emoji(s_emote, "neutral");
+        emote_api_unlock();
+    }
     emote_set_status_event("Ready");
+
+    /* The animated face now owns the panel. Switch the renderer into FACE mode
+     * after the first animation is ready. The next frame callback refreshes the
+     * complete canvas without requiring an emote call from this handoff. */
+    esp_xiaozhi_chat_display_set_face_visible(true);
     return ESP_OK;
+}
+
+static esp_err_t esp_xiaozhi_chat_display_sync_panel(lcd_display_t *lcd)
+{
+    /* tx_param waits for all queued PARLIO color transfers. Sending DISPON
+     * without changing the panel orientation gives the renderer handoff a
+     * synchronization point without rewriting MADCTL. */
+    return esp_lcd_panel_disp_on_off(lcd->panel, true);
 }
 
 esp_err_t esp_xiaozhi_chat_display_set_face_visible(bool visible)
@@ -370,7 +714,15 @@ esp_err_t esp_xiaozhi_chat_display_set_face_visible(bool visible)
      * start/stop (lvgl_port_stop/resume) is performed OUTSIDE the lock to avoid
      * re-entering the same mutex. */
     if (visible) {
+        if (!s_emote_active || s_emote == NULL) {
+            ESP_LOGI(TAG, "Face requested before emote is ready; keep LVGL active");
+            return ESP_OK;
+        }
         /* FACE mode: emote drives the panel, LVGL must not flush over it. */
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_face_accept_flush = false;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+        panel_wait_for_flush_idle();
         if (esp_xiaozhi_chat_display_lock(s_display, 1000)) {
             if (s_page_root != NULL) {
                 lv_obj_add_flag(s_page_root, LV_OBJ_FLAG_HIDDEN);
@@ -381,13 +733,43 @@ esp_err_t esp_xiaozhi_chat_display_set_face_visible(bool visible)
             if (lcd->status_bar != NULL) {
                 lv_obj_add_flag(lcd->status_bar, LV_OBJ_FLAG_HIDDEN);
             }
+            lv_obj_t *screen = lv_screen_active();
+            lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
+            lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+            lv_obj_invalidate(screen);
+            if (lcd->base.lv_disp != NULL) {
+                lv_refr_now(lcd->base.lv_disp);
+            }
             esp_xiaozhi_chat_display_unlock(s_display);
         }
-        s_face_visible = true;
         lvgl_port_stop();
+        panel_wait_for_flush_idle();
+        esp_err_t sync_ret = esp_xiaozhi_chat_display_sync_panel(lcd);
+        if (sync_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to synchronize face panel: %s", esp_err_to_name(sync_ret));
+        }
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_face_visible = true;
+        s_face_accept_flush = true;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+        /* Resume the eye animation stopped while a PAGE owned the panel. This
+         * only touches the emote's own mutex (not LVGL's recursive lock). */
+        emote_set_eye_anim_running(true);
+        /* The next emote frame will refresh the canvas. */
     } else {
         /* PAGE mode: LVGL owns the panel; emote keeps running but its flush is
          * a no-op (see emote_on_flush_ready). */
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_face_accept_flush = false;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+        panel_wait_for_flush_idle();
+        esp_err_t sync_ret = esp_xiaozhi_chat_display_sync_panel(lcd);
+        if (sync_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to synchronize page panel: %s", esp_err_to_name(sync_ret));
+        }
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_face_visible = false;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
         if (esp_xiaozhi_chat_display_lock(s_display, 1000)) {
             if (lcd->container != NULL) {
                 lv_obj_add_flag(lcd->container, LV_OBJ_FLAG_HIDDEN);
@@ -400,8 +782,191 @@ esp_err_t esp_xiaozhi_chat_display_set_face_visible(bool visible)
             }
             esp_xiaozhi_chat_display_unlock(s_display);
         }
-        s_face_visible = false;
         lvgl_port_resume();
+        /* The face is hidden now: stop its continuous animation so the emote
+         * render task stops drawing frames whose flush would be discarded. */
+        emote_set_eye_anim_running(false);
+    }
+    return ESP_OK;
+}
+
+static esp_err_t video_prepare_rotate_buffer(int width, int height)
+{
+#if CONFIG_ESP_BOARD_TBAO_S31_BOARD
+    size_t pixels = (size_t)width * (size_t)height;
+    if (s_video_rotate_buffer != NULL &&
+        s_video_rotate_buffer_pixels >= pixels) {
+        return ESP_OK;
+    }
+    size_t bytes = pixels * sizeof(uint16_t);
+    uint16_t *buffer = (uint16_t *)heap_caps_aligned_alloc(
+        64, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buffer == NULL) {
+        buffer = (uint16_t *)heap_caps_aligned_alloc(
+            64, bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (buffer == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    heap_caps_free(s_video_rotate_buffer);
+    s_video_rotate_buffer = buffer;
+    s_video_rotate_buffer_pixels = pixels;
+#else
+    (void)width;
+    (void)height;
+#endif
+    return ESP_OK;
+}
+
+/* LVGL performs this conversion from native RGB565 to the panel's big-endian
+ * wire order when swap_bytes is enabled. Video frames bypass LVGL, so the
+ * direct panel path has to do the same conversion after software rotation. */
+static void video_swap_rgb565_bytes(uint16_t *buffer, int width, int height)
+{
+#if CONFIG_ESP_BOARD_TBAO_S31_BOARD
+    if (buffer == NULL || width <= 0 || height <= 0) {
+        return;
+    }
+    uint8_t *bytes = (uint8_t *)buffer;
+    const size_t pixel_count = (size_t)width * (size_t)height;
+    for (size_t i = 0; i < pixel_count; ++i) {
+        const uint8_t low_byte = bytes[i * 2U];
+        bytes[i * 2U] = bytes[i * 2U + 1U];
+        bytes[i * 2U + 1U] = low_byte;
+    }
+#else
+    (void)buffer;
+    (void)width;
+    (void)height;
+#endif
+}
+
+esp_err_t esp_xiaozhi_chat_display_set_video_visible(bool visible)
+{
+    if (s_display == NULL || s_display->kind != DISPLAY_KIND_LCD) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    lcd_display_t *lcd = (lcd_display_t *)s_display;
+    if (visible) {
+        if (s_video_visible) {
+            return ESP_OK;
+        }
+        if (s_video_flush_sem == NULL) {
+            s_video_flush_sem = xSemaphoreCreateBinary();
+            if (s_video_flush_sem == NULL) {
+                return ESP_ERR_NO_MEM;
+            }
+        }
+        esp_err_t ret = video_prepare_rotate_buffer(s_display->width,
+                                                    s_display->height);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+    portENTER_CRITICAL(&s_panel_flush_lock);
+    s_video_accept_flush = false;
+    portEXIT_CRITICAL(&s_panel_flush_lock);
+    panel_wait_for_flush_idle();
+        if (esp_xiaozhi_chat_display_lock(s_display, 1000)) {
+            if (s_page_root != NULL) {
+                lv_obj_add_flag(s_page_root, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (lcd->container != NULL) {
+                lv_obj_add_flag(lcd->container, LV_OBJ_FLAG_HIDDEN);
+            }
+            if (lcd->status_bar != NULL) {
+                lv_obj_add_flag(lcd->status_bar, LV_OBJ_FLAG_HIDDEN);
+            }
+            esp_xiaozhi_chat_display_unlock(s_display);
+        }
+        lvgl_port_stop();
+        esp_xiaozhi_chat_display_sync_panel(lcd);
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_video_visible = true;
+        s_video_accept_flush = true;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+        return ESP_OK;
+    }
+
+    if (!s_video_visible) {
+        return ESP_OK;
+    }
+    portENTER_CRITICAL(&s_panel_flush_lock);
+    s_video_accept_flush = false;
+    portEXIT_CRITICAL(&s_panel_flush_lock);
+    panel_wait_for_flush_idle();
+    esp_xiaozhi_chat_display_sync_panel(lcd);
+    portENTER_CRITICAL(&s_panel_flush_lock);
+    s_video_visible = false;
+    portEXIT_CRITICAL(&s_panel_flush_lock);
+    if (esp_xiaozhi_chat_display_lock(s_display, 1000)) {
+        if (lcd->container != NULL) {
+            lv_obj_add_flag(lcd->container, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (lcd->status_bar != NULL) {
+            lv_obj_add_flag(lcd->status_bar, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (s_page_root != NULL) {
+            lv_obj_clear_flag(s_page_root, LV_OBJ_FLAG_HIDDEN);
+        }
+        esp_xiaozhi_chat_display_unlock(s_display);
+    }
+    lvgl_port_resume();
+    return ESP_OK;
+}
+
+esp_err_t esp_xiaozhi_chat_display_present_video_frame(const uint16_t *frame,
+                                                       int width, int height)
+{
+    if (frame == NULL || width <= 0 || height <= 0 || s_display == NULL ||
+        s_display->kind != DISPLAY_KIND_LCD) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    lcd_display_t *lcd = (lcd_display_t *)s_display;
+    if (width != s_display->width || height != s_display->height ||
+        s_video_flush_sem == NULL) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    bool active;
+    portENTER_CRITICAL(&s_panel_flush_lock);
+    active = s_video_visible && s_video_accept_flush;
+    portEXIT_CRITICAL(&s_panel_flush_lock);
+    if (!active) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    while (xSemaphoreTake(s_video_flush_sem, 0) == pdTRUE) {
+    }
+    const void *draw_data = frame;
+    int x_start = 0;
+    int y_start = 0;
+    int x_end = width;
+    int y_end = height;
+#if CONFIG_ESP_BOARD_TBAO_S31_BOARD
+    lv_draw_sw_rotate(frame, s_video_rotate_buffer, width, height,
+                      width * (int)sizeof(uint16_t),
+                      height * (int)sizeof(uint16_t),
+                      LV_DISPLAY_ROTATION_270, LV_COLOR_FORMAT_RGB565);
+    draw_data = s_video_rotate_buffer;
+#endif
+    video_swap_rgb565_bytes((uint16_t *)draw_data, width, height);
+
+    portENTER_CRITICAL(&s_panel_flush_lock);
+    s_panel_flush_owner = PANEL_FLUSH_OWNER_VIDEO;
+    portEXIT_CRITICAL(&s_panel_flush_lock);
+    esp_err_t ret = esp_lcd_panel_draw_bitmap(lcd->panel, x_start, y_start,
+                                               x_end, y_end, draw_data);
+    if (ret != ESP_OK) {
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_panel_flush_owner = PANEL_FLUSH_OWNER_NONE;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+        return ret;
+    }
+    if (xSemaphoreTake(s_video_flush_sem, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_panel_flush_owner = PANEL_FLUSH_OWNER_NONE;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+        return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
 }
@@ -497,6 +1062,10 @@ static esp_err_t esp_xiaozhi_chat_display_state_init(display_t *disp)
     ESP_RETURN_ON_FALSE(disp, ESP_ERR_INVALID_STATE, TAG, "Display not initialized");
 
     disp->battery_icon = NULL;
+    disp->battery_percent = -1;
+    disp->battery_valid = false;
+    disp->battery_charging = false;
+    disp->low_battery_warning_visible = false;
     disp->network_icon = NULL;
     disp->muted = false;
     strlcpy(disp->current_theme_name, "light", sizeof(disp->current_theme_name));
@@ -533,6 +1102,7 @@ static esp_err_t esp_xiaozhi_chat_display_setup_ui(lcd_display_t *lcd)
 
     lcd->container = lv_obj_create(screen);
     lv_obj_set_size(lcd->container, LV_HOR_RES, LV_VER_RES);
+    lv_obj_add_flag(lcd->container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_flex_flow(lcd->container, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_all(lcd->container, 0, 0);
     lv_obj_set_style_border_width(lcd->container, 0, 0);
@@ -594,7 +1164,8 @@ static esp_err_t esp_xiaozhi_chat_display_setup_ui(lcd_display_t *lcd)
     lv_label_set_long_mode(disp->status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_style_text_align(disp->status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(disp->status_label, lcd->current_theme.text, 0);
-    lv_label_set_text(disp->status_label, LANG_STR_INITIALIZING);
+    lv_label_set_text(disp->status_label,
+                      app_language_text(LANG_STR_INITIALIZING, "Initializing..."));
     disp->mute_label = lv_label_create(lcd->status_bar);
     lv_label_set_text(disp->mute_label, "");
     lv_obj_set_style_text_font(disp->mute_label, lcd->fonts.icon_font, 0);
@@ -610,7 +1181,9 @@ static esp_err_t esp_xiaozhi_chat_display_setup_ui(lcd_display_t *lcd)
     lv_obj_set_style_bg_color(disp->low_battery_popup, lcd->current_theme.low_battery, 0);
     lv_obj_set_style_radius(disp->low_battery_popup, 10, 0);
     disp->low_battery_label = lv_label_create(disp->low_battery_popup);
-    lv_label_set_text(disp->low_battery_label, LANG_STR_BATTERY_NEED_CHARGE);
+    lv_label_set_text(disp->low_battery_label,
+                      app_language_text(LANG_STR_BATTERY_NEED_CHARGE,
+                                        "Low battery, please charge"));
     lv_obj_set_style_text_color(disp->low_battery_label, lv_color_white(), 0);
     lv_obj_center(disp->low_battery_label);
     lv_obj_add_flag(disp->low_battery_popup, LV_OBJ_FLAG_HIDDEN);
@@ -715,13 +1288,81 @@ static esp_err_t esp_xiaozhi_chat_display_destroy(display_t *disp)
  * the flush-ready event is lost to the race we never spin on the core and never
  * trigger the WDT. This is a hard guarantee against the IDLE starvation reboot.
  */
+#define LVGL_FLUSH_WAIT_TIMEOUT_MS 100
+
+/* The PARLIO completion callback clears disp->flushing after DMA finishes.
+ * Sleep while it is set so the LVGL task does not busy-spin, and keep a
+ * timeout for the renderer handoff case where emote consumes that callback. */
 static void lvgl_port_flush_wait_cb(lv_display_t *disp)
 {
-    (void)disp;
-    /* Yield the core long enough for the flush-done ISR to run. After this
-     * returns, wait_for_flushing() sets disp->flushing = 0 unconditionally, so
-     * this callback never spins regardless of whether the ISR arrived. */
-    vTaskDelay(1);
+    if (disp == NULL) {
+        return;
+    }
+
+    const TickType_t start = xTaskGetTickCount();
+    const TickType_t timeout = pdMS_TO_TICKS(LVGL_FLUSH_WAIT_TIMEOUT_MS);
+    while (disp->flushing != 0) {
+        if ((xTaskGetTickCount() - start) >= timeout) {
+            ESP_LOGW(TAG, "LCD flush wait timeout after %d ms", LVGL_FLUSH_WAIT_TIMEOUT_MS);
+            break;
+        }
+        vTaskDelay(1);
+    }
+}
+
+static void lcd_display_perf_event_cb(lv_event_t *event)
+{
+    lcd_display_t *lcd = (lcd_display_t *)lv_event_get_user_data(event);
+    if (lcd == NULL) {
+        return;
+    }
+
+    const lv_event_code_t code = lv_event_get_code(event);
+    const int64_t now_us = esp_timer_get_time();
+    if (lcd->perf.window_start_us == 0) {
+        lcd->perf.window_start_us = now_us;
+    }
+
+    switch (code) {
+    case LV_EVENT_FLUSH_START: {
+        portENTER_CRITICAL(&s_panel_flush_lock);
+        s_panel_flush_owner = PANEL_FLUSH_OWNER_LVGL;
+        portEXIT_CRITICAL(&s_panel_flush_lock);
+        const lv_area_t *area = (const lv_area_t *)lv_event_get_param(event);
+        lcd->perf.flush_count++;
+        if (area != NULL) {
+            lcd->perf.pixels += (uint64_t)lv_area_get_width(area) * (uint64_t)lv_area_get_height(area);
+        }
+        break;
+    }
+    case LV_EVENT_FLUSH_WAIT_START:
+        lcd->perf.wait_start_us = now_us;
+        break;
+    case LV_EVENT_FLUSH_WAIT_FINISH:
+        if (lcd->perf.wait_start_us != 0) {
+            lcd->perf.wait_us += (uint64_t)(now_us - lcd->perf.wait_start_us);
+            lcd->perf.wait_start_us = 0;
+        }
+        break;
+    case LV_EVENT_REFR_READY:
+        lcd->perf.refresh_count++;
+        break;
+    default:
+        break;
+    }
+
+    if (code == LV_EVENT_REFR_READY && now_us - lcd->perf.window_start_us >= 1000000) {
+        const uint64_t elapsed_us = (uint64_t)(now_us - lcd->perf.window_start_us);
+        const uint32_t fps_x100 = (uint32_t)((uint64_t)lcd->perf.refresh_count * 100000000ULL / elapsed_us);
+        const uint64_t pixels_per_sec = lcd->perf.pixels * 1000000ULL / elapsed_us;
+        ESP_LOGI(TAG,
+                 "LCD perf: fps=%" PRIu32 ".%02" PRIu32 " flush=%" PRIu32
+                 " pixels/s=%" PRIu64 " dma_wait=%" PRIu64 " ms",
+                 fps_x100 / 100, fps_x100 % 100, lcd->perf.flush_count,
+                 pixels_per_sec, lcd->perf.wait_us / 1000ULL);
+        memset(&lcd->perf, 0, sizeof(lcd->perf));
+        lcd->perf.window_start_us = now_us;
+    }
 }
 
 static display_t *esp_xiaozhi_chat_display_create(esp_lcd_panel_io_handle_t panel_io,
@@ -748,7 +1389,7 @@ static display_t *esp_xiaozhi_chat_display_create(esp_lcd_panel_io_handle_t pane
     uint16_t *buffer = (uint16_t *)heap_caps_malloc((size_t)width * sizeof(uint16_t), MALLOC_CAP_8BIT);
     if (buffer != NULL) {
         for (int i = 0; i < width; ++i) {
-            buffer[i] = 0xFFFF;
+            buffer[i] = 0x0000;
         }
         for (int y = 0; y < height; ++y) {
             esp_lcd_panel_draw_bitmap(panel, 0, y, width, y + 1, buffer);
@@ -764,7 +1405,7 @@ static display_t *esp_xiaozhi_chat_display_create(esp_lcd_panel_io_handle_t pane
     if (!s_lvgl_port_inited) {
         lvgl_port_cfg_t port_cfg = ESP_LVGL_PORT_INIT_CONFIG();
         port_cfg.task_priority = 3;         /* keep UI responsive (emote=5) */
-        port_cfg.timer_period_ms = 20;      /* 50Hz tick -> smooth animations */
+        port_cfg.timer_period_ms = 10;      /* 100Hz LVGL tick for smooth input and animation */
         /* Pin LVGL to CPU1: the emote face task runs on CPU0 at prio 5 and the
          * WiFi task on CPU0 at prio 23. With task_affinity=-1 FreeRTOS could
          * place LVGL on CPU0 too, where the boot burst (WiFi connect + emote
@@ -776,10 +1417,9 @@ static display_t *esp_xiaozhi_chat_display_create(esp_lcd_panel_io_handle_t pane
         s_lvgl_port_inited = true;
     }
 
-    /* Double-buffered, PSRAM-backed LVGL. buffer_size = height*40px per buffer
-     * (~28 KB each). Double buffering lets LVGL draw into the back buffer while
-     * the SPI DMA flushes the front one -> no tearing, higher effective frame
-     * rate on the 360x360 panel.
+    /* Full-frame, double-buffered, PSRAM-backed LVGL. A complete frame is
+     * submitted as one PARLIO transaction so the ST7796 GRAM is not updated
+     * in visible strips while the panel is scanning it.
      * buff_spiram = 1: the ST77916 QSPI driver needs a ~14 KB "private TX
      * buffer" per draw_bitmap; when the LVGL buffer also lived in internal DMA
      * SRAM the two competed and the SPI bounce buffer allocation failed
@@ -789,7 +1429,7 @@ static display_t *esp_xiaozhi_chat_display_create(esp_lcd_panel_io_handle_t pane
         .io_handle = panel_io,
         .panel_handle = panel,
         .control_handle = NULL,
-        .buffer_size = (uint32_t)(width * 40),
+        .buffer_size = (uint32_t)(width * height),
         .double_buffer = true,
         .trans_size = 0,
         .hres = (uint32_t)width,
@@ -797,7 +1437,7 @@ static display_t *esp_xiaozhi_chat_display_create(esp_lcd_panel_io_handle_t pane
         .monochrome = false,
         .rotation = { .swap_xy = swap_xy, .mirror_x = mirror_x, .mirror_y = mirror_y },
         .color_format = LV_COLOR_FORMAT_RGB565,
-        .flags = { .buff_dma = 1, .buff_spiram = 1, .sw_rotate = 0, .swap_bytes = 1, .full_refresh = 0, .direct_mode = 0 },
+        .flags = { .buff_dma = 1, .buff_spiram = 1, .sw_rotate = TBAO_LCD_SW_ROTATE, .swap_bytes = 1, .full_refresh = 1, .direct_mode = 0 },
     };
     lcd->base.lv_disp = lvgl_port_add_disp(&display_cfg);
     if (lcd->base.lv_disp == NULL) {
@@ -805,14 +1445,29 @@ static display_t *esp_xiaozhi_chat_display_create(esp_lcd_panel_io_handle_t pane
         esp_xiaozhi_chat_display_destroy(&lcd->base);
         return NULL;
     }
+#if CONFIG_ESP_BOARD_TBAO_S31_BOARD
+    if (lvgl_port_lock(30000)) {
+        lv_display_set_rotation(lcd->base.lv_disp, LV_DISPLAY_ROTATION_270);
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "T-Bao S31 LCD rotation: software clockwise 270 degrees");
+    } else {
+        ESP_LOGE(TAG, "Failed to lock LVGL while setting T-Bao S31 LCD rotation");
+    }
+#endif
     if (offset_x != 0 || offset_y != 0) {
         lv_display_set_offset(lcd->base.lv_disp, offset_x, offset_y);
     }
-    /* Give LVGL a flush_wait callback. This is a hard guard against the
-     * `wait_for_flushing()` busy-spin that otherwise starves the IDLE task and
-     * trips task_wdt when the emote engine swallows a flush-ready event during
-     * the PAGE<->FACE renderer switch (see lvgl_port_flush_wait_cb above). */
+    /* Wait for PARLIO DMA completion before LVGL reuses the other draw buffer,
+     * while keeping a timeout for a renderer handoff that loses the callback. */
     lv_display_set_flush_wait_cb(lcd->base.lv_disp, lvgl_port_flush_wait_cb);
+    lv_display_add_event_cb(lcd->base.lv_disp, lcd_display_perf_event_cb,
+                            LV_EVENT_FLUSH_START, lcd);
+    lv_display_add_event_cb(lcd->base.lv_disp, lcd_display_perf_event_cb,
+                            LV_EVENT_FLUSH_WAIT_START, lcd);
+    lv_display_add_event_cb(lcd->base.lv_disp, lcd_display_perf_event_cb,
+                            LV_EVENT_FLUSH_WAIT_FINISH, lcd);
+    lv_display_add_event_cb(lcd->base.lv_disp, lcd_display_perf_event_cb,
+                            LV_EVENT_REFR_READY, lcd);
     esp_xiaozhi_chat_display_setup_ui(lcd);
 
     /* Register a POINTER input device that reads the raw touch state from
@@ -831,22 +1486,20 @@ static display_t *esp_xiaozhi_chat_display_create(esp_lcd_panel_io_handle_t pane
     return &lcd->base;
 }
 
-/* LVGL pointer input read callback: mirrors ui_touch's latest state. */
+/* LVGL pointer input read callback: mirrors ui_touch's pre-rotation state. */
 void lvgl_port_touch_mirror_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
     int x = -1, y = -1;
     bool pressed = false;
     ui_touch_get_pos(&x, &y, &pressed);
-    if (pressed && x >= 0 && y >= 0) {
-        data->point.x = (lv_coord_t)x;
-        data->point.y = (lv_coord_t)y;
-        data->state = LV_INDEV_STATE_PRESSED;
-    } else {
-        data->point.x = 0;
-        data->point.y = 0;
-        data->state = LV_INDEV_STATE_RELEASED;
-    }
+    /* LVGL sends one final RELEASED event through the slider. Keep the last
+     * valid point for that event; using (0, 0) makes every drag snap to zero. */
+    data->point.x = x >= 0 ? (lv_coord_t)x : 0;
+    data->point.y = y >= 0 ? (lv_coord_t)y : 0;
+    data->state = pressed && x >= 0 && y >= 0
+                      ? LV_INDEV_STATE_PRESSED
+                      : LV_INDEV_STATE_RELEASED;
 }
 
 static esp_err_t esp_xiaozhi_chat_display_required(void)
@@ -857,6 +1510,15 @@ static esp_err_t esp_xiaozhi_chat_display_required(void)
 esp_err_t esp_xiaozhi_chat_display_init(void)
 {
     esp_err_t ret = ESP_OK;
+
+    if (s_emote_api_mutex == NULL) {
+        s_emote_api_mutex = xSemaphoreCreateMutex();
+        if (s_emote_api_mutex == NULL) {
+            ESP_LOGE(TAG, "Failed to create emote API mutex");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     void *lcd_handle = NULL;
     ret = esp_board_manager_get_device_handle("display_lcd", &lcd_handle);
     if (ret != ESP_OK || lcd_handle == NULL) {
@@ -947,6 +1609,35 @@ esp_err_t esp_xiaozhi_chat_display_set_status(const char *status)
     return ESP_OK;
 }
 
+esp_err_t esp_xiaozhi_chat_display_clear_status(void)
+{
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG, "Display not initialized");
+
+    if (s_emote_active) {
+        /* The emote manager's OFF event hides the status icon and toast label. */
+        emote_set_status_event("Ready");
+        return ESP_OK;
+    }
+
+    if (!esp_xiaozhi_chat_display_lock(s_display, 30000)) {
+        return ESP_OK;
+    }
+    if (s_display->notification_label != NULL) {
+        lv_label_set_text(s_display->notification_label, "");
+        lv_obj_add_flag(s_display->notification_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_display->status_label != NULL) {
+        lv_label_set_text(s_display->status_label, "");
+        lv_obj_add_flag(s_display->status_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    esp_xiaozhi_chat_display_unlock(s_display);
+
+    if (s_display->notification_timer != NULL) {
+        esp_timer_stop(s_display->notification_timer);
+    }
+    return ESP_OK;
+}
+
 esp_err_t esp_xiaozhi_chat_display_set_subtitle(const char *subtitle)
 {
     ESP_RETURN_ON_FALSE(subtitle, ESP_ERR_INVALID_ARG, TAG, "Invalid subtitle");
@@ -982,6 +1673,91 @@ esp_err_t esp_xiaozhi_chat_display_set_volume(int volume)
     return ESP_OK;
 }
 
+static const char *battery_icon_for_percent(int percent)
+{
+    if (percent >= 90) {
+        return LV_SYMBOL_BATTERY_FULL;
+    }
+    if (percent >= 70) {
+        return LV_SYMBOL_BATTERY_3;
+    }
+    if (percent >= 45) {
+        return LV_SYMBOL_BATTERY_2;
+    }
+    if (percent >= 20) {
+        return LV_SYMBOL_BATTERY_1;
+    }
+    return LV_SYMBOL_BATTERY_EMPTY;
+}
+
+esp_err_t esp_xiaozhi_chat_display_set_battery(int percent,
+                                               bool charging,
+                                               bool valid)
+{
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG,
+                        "Display not initialized");
+    if (valid && (percent < 0 || percent > 100)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    s_display->battery_percent = valid ? percent : -1;
+    s_display->battery_valid = valid;
+    s_display->battery_charging = charging;
+
+    /* The emote renderer owns the panel in FACE mode and LVGL is stopped, so
+     * only send the emote event in that mode. When a PAGE owns the panel, keep
+     * the LVGL status bar up to date instead. */
+    if (s_emote_active && s_face_visible) {
+        if (!valid || percent < 0) {
+            /* Do not manufacture a 0% reading for an invalid ADC sample. The
+             * next valid sample will refresh the emote battery widget. */
+            return ESP_OK;
+        }
+        char message[24];
+        snprintf(message, sizeof(message), "%d,%d", charging ? 1 : 0,
+                 percent);
+        if (!emote_api_lock("battery")) {
+            return ESP_ERR_TIMEOUT;
+        }
+        esp_err_t ret = emote_set_event_msg(s_emote, EMOTE_MGR_EVT_BAT, message);
+        emote_api_unlock();
+        return ret;
+    }
+
+    if (!esp_xiaozhi_chat_display_lock(s_display, 30000)) {
+        return ESP_OK;
+    }
+
+    const char *icon = valid ? battery_icon_for_percent(percent) : "";
+    if (s_display->kind == DISPLAY_KIND_LCD) {
+        lcd_display_t *lcd = esp_xiaozhi_chat_display_from_base(s_display);
+        if (s_display->battery_label != NULL) {
+            if (valid && charging) {
+                lv_label_set_text_fmt(s_display->battery_label, "%s%s", icon,
+                                      LV_SYMBOL_CHARGE);
+            } else {
+                lv_label_set_text(s_display->battery_label, icon);
+            }
+        }
+
+        if (s_display->low_battery_popup != NULL) {
+            if (!valid) {
+                s_display->low_battery_warning_visible = false;
+                lv_obj_add_flag(s_display->low_battery_popup, LV_OBJ_FLAG_HIDDEN);
+            } else if (!s_display->low_battery_warning_visible && percent <= 15) {
+                s_display->low_battery_warning_visible = true;
+                lv_obj_clear_flag(s_display->low_battery_popup, LV_OBJ_FLAG_HIDDEN);
+            } else if (s_display->low_battery_warning_visible && percent >= 20) {
+                s_display->low_battery_warning_visible = false;
+                lv_obj_add_flag(s_display->low_battery_popup, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        (void)lcd;
+    }
+    esp_xiaozhi_chat_display_unlock(s_display);
+    return ESP_OK;
+}
+
 esp_err_t esp_xiaozhi_chat_display_set_brightness(int brightness)
 {
     ESP_RETURN_ON_FALSE(brightness >= 0 && brightness <= 100, ESP_ERR_INVALID_ARG, TAG, "Invalid brightness");
@@ -998,7 +1774,11 @@ esp_err_t esp_xiaozhi_chat_display_set_notification(const char *notification, in
     ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG, "Display not initialized");
 
     if (s_emote_active) {
+        if (!emote_api_lock("notification")) {
+            return ESP_ERR_TIMEOUT;
+        }
         emote_set_event_msg(s_emote, EMOTE_MGR_EVT_SYS, notification);
+        emote_api_unlock();
         return ESP_OK;
     }
 
@@ -1025,9 +1805,27 @@ esp_err_t esp_xiaozhi_chat_display_set_emotion(const char *emotion)
     ESP_RETURN_ON_FALSE(emotion, ESP_ERR_INVALID_ARG, TAG, "Invalid emotion");
     ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG, "Display not initialized");
 
+    const size_t emotion_index = emote_index_for(emotion);
+
     if (s_emote_active) {
-        emote_set_anim_emoji(s_emote, emote_anim_for(emotion));
-        return ESP_OK;
+        if (!emote_api_lock("emotion")) {
+            return ESP_ERR_TIMEOUT;
+        }
+        esp_err_t ret = emote_set_anim_emoji(s_emote, emote_anim_for(emotion));
+        emote_api_unlock();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set emotion '%s': %s", emotion, esp_err_to_name(ret));
+        } else {
+            emote_record_current_index(emotion_index);
+            s_last_eye_anim = emote_anim_for(emotion);
+            /* set_anim_emoji starts playback; keep it stopped while a PAGE owns
+             * the panel.  The animation name is kept, so showing the face
+             * resumes this exact animation. */
+            if (!s_face_visible) {
+                emote_set_eye_anim_running(false);
+            }
+        }
+        return ret;
     }
     /* LVGL fallback (no emote): show the emotion icon on the status label. */
     if (!esp_xiaozhi_chat_display_lock(s_display, 30000) || s_display->emotion_label == NULL) {
@@ -1042,24 +1840,72 @@ esp_err_t esp_xiaozhi_chat_display_set_emotion(const char *emotion)
     }
     lv_label_set_text(s_display->emotion_label, icon);
     esp_xiaozhi_chat_display_unlock(s_display);
+
+    emote_record_current_index(emotion_index);
     return ESP_OK;
 }
 
-/* Petting / laughing reactions used by the face page gestures. Play the
- * official emote animation on top of the current one. */
+bool esp_xiaozhi_chat_display_emote_is_idle(void)
+{
+    bool idle;
+    portENTER_CRITICAL(&s_emote_state_lock);
+    idle = s_emote_active && s_emote_idle;
+    portEXIT_CRITICAL(&s_emote_state_lock);
+    return idle;
+}
+
+esp_err_t esp_xiaozhi_chat_display_set_random_emotion(void)
+{
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG, "Display not initialized");
+    if (EMOTE_MAP_COUNT < 2) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    int current_index;
+    portENTER_CRITICAL(&s_emote_state_lock);
+    current_index = s_emote_current_index;
+    portEXIT_CRITICAL(&s_emote_state_lock);
+    if (current_index < 0 || current_index >= (int)EMOTE_MAP_COUNT) {
+        current_index = 0;
+    }
+
+    /* Pick from all entries except the current one, so every interaction is a
+     * visible change. Timed idle rotation is gated by the face page instead. */
+    const size_t offset = esp_random() % (EMOTE_MAP_COUNT - 1);
+    const size_t next_index = offset >= (size_t)current_index ? offset + 1 : offset;
+    return esp_xiaozhi_chat_display_set_emotion(s_emote_map[next_index].emotion);
+}
+
+/* Face-page gestures use the closest available dedicated animations. */
 void esp_xiaozhi_chat_display_pet(void)
 {
     if (s_emote_active && s_emote != NULL) {
-        emote_set_anim_emoji(s_emote, "shy_20s_40s");
-        emote_insert_anim_dialog(s_emote, "shy_20s_40s", 2500);
+        const char *anim = emote_anim_for("winking");
+        if (!emote_api_lock("pet")) {
+            return;
+        }
+        if (emote_set_anim_emoji(s_emote, anim) == ESP_OK) {
+            emote_record_current_index(emote_index_for("winking"));
+            s_last_eye_anim = anim;
+        }
+        emote_insert_anim_dialog(s_emote, anim, 2500);
+        emote_api_unlock();
     }
 }
 
 void esp_xiaozhi_chat_display_laugh(void)
 {
     if (s_emote_active && s_emote != NULL) {
-        emote_set_anim_emoji(s_emote, "laugh_05s_10");
-        emote_insert_anim_dialog(s_emote, "laugh_05s_10", 2500);
+        const char *anim = emote_anim_for("happy");
+        if (!emote_api_lock("laugh")) {
+            return;
+        }
+        if (emote_set_anim_emoji(s_emote, anim) == ESP_OK) {
+            emote_record_current_index(emote_index_for("happy"));
+            s_last_eye_anim = anim;
+        }
+        emote_insert_anim_dialog(s_emote, anim, 2500);
+        emote_api_unlock();
     }
 }
 
@@ -1070,11 +1916,15 @@ esp_err_t esp_xiaozhi_chat_display_set_chat_message(const char *role, const char
     ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG, "Display not initialized");
 
     if (s_emote_active) {
+        if (!emote_api_lock("chat message")) {
+            return ESP_ERR_TIMEOUT;
+        }
         if (strcmp(role, "user") == 0) {
             emote_set_event_msg(s_emote, EMOTE_MGR_EVT_SYS, content);
         } else {
             emote_set_event_msg(s_emote, EMOTE_MGR_EVT_SPEAK, content);
         }
+        emote_api_unlock();
         return ESP_OK;
     }
 

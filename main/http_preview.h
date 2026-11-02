@@ -1,5 +1,5 @@
 /*
- * http_preview.h — local MJPEG preview server for the SC101IOT camera.
+ * http_preview.h - local MJPEG preview server for the T-Bao S31 camera.
  *
  * Serves the live camera JPEG stream over HTTP so a phone/PC on the same Wi-Fi
  * can watch the picture by opening http://<board-ip>/stream (or grab a single
@@ -13,10 +13,10 @@
 extern "C" {
 #endif
 
-/** @brief Start the preview server (also starts the camera pipeline). */
+/** @brief Start the preview server; camera demand is owned by the camera page. */
 esp_err_t http_preview_start(void);
 
-/** @brief Stop the preview server (releases the camera reference). */
+/** @brief Stop the preview server and release its web camera lease. */
 esp_err_t http_preview_stop(void);
 
 /** @brief True if the preview server is running. */

@@ -10,7 +10,7 @@
 #include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_log.h"
-#include "driver/gpio.h"
+#include "tbao_s31_board.h"
 
 #include "esp_ae_types.h"
 #include "esp_ae_drc.h"
@@ -123,10 +123,23 @@ esp_err_t app_audio_dsp_init_playback(uint32_t sample_rate, uint8_t channels, ui
 
     /* 2) EQ: single high-shelf to cut the high-frequency hiss (滋滋声) only.
      *    One filter instead of three keeps the per-block cost low while still
-     *    cleaning the tone. */
-    static esp_ae_eq_filter_para_t eq_para[] = {
-        {.filter_type = ESP_AE_EQ_FILTER_HIGH_SHELF,.fc = 8000, .q = 0.707f, .gain = -8.0f},
+     *    cleaning the tone.
+     *
+     *    The cutoff must stay well below Nyquist.  The board runs at 16 kHz,
+     *    so the previous fc=8000 Hz sat exactly at fs/2: the shelf degenerates
+     *    into a pole on the unit circle at Nyquist, which rings at 8 kHz and is
+     *    heard as the "尖尖" squeal over XiaoZhi's TTS (music/SFX bypass this
+     *    chain, which is why only speech was affected).  Keep fc at ~0.34*fs
+     *    (5.5 kHz at 16 kHz) so the high band is actually attenuated. */
+    static esp_ae_eq_filter_para_t eq_para[1];
+    eq_para[0] = (esp_ae_eq_filter_para_t) {
+        .filter_type = ESP_AE_EQ_FILTER_HIGH_SHELF,
+        .fc = (uint32_t)((uint64_t)sample_rate * 11U / 32U),
+        .q = 0.707f,
+        .gain = -8.0f,
     };
+    ESP_LOGI(TAG, "Playback EQ: high-shelf fc=%u Hz (fs=%u Hz), gain=%.1f dB",
+             (unsigned)eq_para[0].fc, (unsigned)sample_rate, eq_para[0].gain);
     esp_ae_eq_cfg_t eq_cfg = {
         .sample_rate     = sample_rate,
         .channel         = channels,
@@ -147,9 +160,11 @@ esp_err_t app_audio_dsp_init_playback(uint32_t sample_rate, uint8_t channels, ui
     s_howl = NULL;
     s_howl_frame = 0;
 
-    /* 4) ALC: automatic level control / slight makeup so the limiter above does
-     *    not make the overall output feel quieter. +6 dB makeup helps the small
-     *    on-board speaker sound louder (VoCat-S31 PA gain is set by resistors). */
+    /* 4) ALC: automatic level control, kept as a safety limiter only.
+     *    It used to add +6 dB makeup, but TTS Opus already arrives near full
+     *    scale, so the makeup mostly amplified the codec noise floor between
+     *    syllables (audible hiss) instead of making speech louder.  Use 0 dB
+     *    gain and let the DAC volume control the loudness. */
     esp_ae_alc_cfg_t alc_cfg = {
         .sample_rate = sample_rate,
         .channel     = channels,
@@ -161,7 +176,7 @@ esp_err_t app_audio_dsp_init_playback(uint32_t sample_rate, uint8_t channels, ui
         ret = ESP_FAIL; goto _err;
     }
     for (uint8_t c = 0; c < channels; c++) {
-        esp_ae_alc_set_gain(s_alc, c, 6);
+        esp_ae_alc_set_gain(s_alc, c, 0);
     }
 
     s_pb_inited = true;
@@ -192,16 +207,12 @@ void __attribute__((weak)) app_audio_dsp_playback_run(uint8_t *data, int len)
     /* Record playback activity for the mic-mute tail gate. */
     s_pb_last_activity_ms = app_audio_dsp_now_ms();
 
-    /* Keep the NS4150B PA (GPIO2) asserted HIGH. The app owns GPIO2 outright
-     * (ES8389 no longer drives it), so this is just a one-time belt-and-suspenders
-     * guard that also confirms, at the first TTS frame, that the pin really reads
-     * HIGH — i.e. the speaker is enabled and audio is reaching it. */
+    /* Keep the amplifier enabled while audio is being written. */
     static bool s_pa_forced = false;
     if (!s_pa_forced) {
-        gpio_set_direction(2, GPIO_MODE_OUTPUT);
-        esp_err_t e = gpio_set_level(2, 1);
-        ESP_LOGI(TAG, "[TTS_AUDIO] PA_GPIO2 guard set HIGH ret=%s lvl=%d",
-                 esp_err_to_name(e), gpio_get_level(2));
+        esp_err_t e = tbao_s31_board_set_speaker(true);
+        ESP_LOGI(TAG, "[TTS_AUDIO] XL9555_P07 amplifier enable ret=%s",
+                 esp_err_to_name(e));
         s_pa_forced = true;
     }
 
@@ -375,6 +386,10 @@ void app_audio_bargein_set_playing(bool playing)
     if (playing) {
         s_play_start_ms = app_audio_dsp_now_ms();
     }
+    /* No VAD-based barge-in at playback onset. Upstream keeps only WakeNet
+     * running in the Speaking state (voice processing/VAD disabled); the VAD
+     * hangover at TTS start otherwise aborted every server answer. Wake-word
+     * interrupts still arrive through the AFE WAKEUP_START event. */
 }
 
 void app_audio_bargein_on_vad(bool vad_active)

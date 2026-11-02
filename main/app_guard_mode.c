@@ -1,136 +1,148 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * app_guard_mode.c — 番茄时钟"守护模式" backend (see header).
+ * app_guard_mode.c - 番茄时钟守护模式 backend.
  */
 #include "app_guard_mode.h"
 
 #include <string.h>
+
+#include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 
+#include "app_activity.h"
 #include "app_camera.h"
 #include "app_camera_preview.h"
 #include "app_vision_lite.h"
-#include "app_activity.h"
 
 static const char *TAG = "GUARD_MODE";
 
-/* DVP capture resolution (matches app_camera.c's internal CAM_WIDTH/HEIGHT). */
-#define GUARD_SRC_W 1280
-#define GUARD_SRC_H 720
-
-/* Analyze the preview every 250 ms (4 fps) — plenty for motion/activity and
- * leaves the CPU to LVGL + audio. */
-#define GUARD_ANALYZE_MS    250
-/* Nobody-at-the-desk alert after this long without meaningful motion. */
+#define GUARD_ANALYZE_MS      250
 #define GUARD_NOBODY_ALERT_MS 60000
+#define GUARD_STACK            (12 * 1024)
 
-static SemaphoreHandle_t s_mtx = NULL;
-static TaskHandle_t s_task = NULL;
-static volatile bool s_running = false;
-static volatile bool s_exited = false;
+static SemaphoreHandle_t s_mutex;
+static TaskHandle_t s_task;
+static volatile bool s_running;
+static volatile bool s_exited;
 
-static uint8_t *s_frame = NULL;
-static size_t   s_frame_len = 0;
-static uint32_t s_frame_seq = 0;
+static uint8_t *s_frame;
+static size_t s_frame_capacity;
+static size_t s_frame_len;
+static uint32_t s_frame_seq;
 
 static guard_status_t s_status = GUARD_STATUS_IDLE;
-static int s_last_ratio = 0;
-static uint32_t s_last_active_ms = 0;
-static uint32_t s_absent_start_ms = 0;
+static int s_last_ratio;
+static uint32_t s_last_active_ms;
+static uint32_t s_absent_start_ms;
 
-#define GUARD_STACK 12 * 1024
-
-static void on_yuv(const uint8_t *uyvy, int w, int h, void *ctx)
+static bool copy_pending_frame(uint8_t **decode_buf, size_t *decode_capacity,
+                               size_t *decode_len, uint32_t *last_seq)
 {
-    (void)w;
-    (void)h;
-    (void)ctx;
-    if (uyvy == NULL || !s_running || s_mtx == NULL) {
-        return;
+    bool ready = false;
+
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
+        return false;
     }
-    if (xSemaphoreTake(s_mtx, 0) != pdTRUE) {
-        return;
-    }
-    size_t len = (size_t)GUARD_SRC_W * GUARD_SRC_H * 2;
-    if (s_frame && s_frame_len >= len) {
-        memcpy(s_frame, uyvy, len);
-        s_frame_len = len;
-    } else {
-        uint8_t *nb = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (nb) {
-            if (s_frame) heap_caps_free(s_frame);
-            s_frame = nb;
-            memcpy(s_frame, uyvy, len);
-            s_frame_len = len;
+    if (s_frame != NULL && s_frame_len > 0 && s_frame_seq != *last_seq) {
+        if (*decode_capacity < s_frame_len) {
+            uint8_t *new_buf = heap_caps_realloc(*decode_buf, s_frame_len,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (new_buf != NULL) {
+                *decode_buf = new_buf;
+                *decode_capacity = s_frame_len;
+            }
+        }
+        if (*decode_buf != NULL && *decode_capacity >= s_frame_len) {
+            memcpy(*decode_buf, s_frame, s_frame_len);
+            *decode_len = s_frame_len;
+            *last_seq = s_frame_seq;
+            ready = true;
         }
     }
-    s_frame_seq++;
-    xSemaphoreGive(s_mtx);
+    xSemaphoreGive(s_mutex);
+    return ready;
+}
+
+static void on_frame(const uint8_t *jpeg, size_t len, void *ctx)
+{
+    (void)ctx;
+    if (!s_running || jpeg == NULL || len == 0 || s_mutex == NULL) {
+        return;
+    }
+    if (xSemaphoreTake(s_mutex, 0) != pdTRUE) {
+        return;
+    }
+    if (s_frame_capacity < len) {
+        uint8_t *new_frame = heap_caps_realloc(s_frame, len,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (new_frame != NULL) {
+            s_frame = new_frame;
+            s_frame_capacity = len;
+        }
+    }
+    if (s_frame != NULL && s_frame_capacity >= len) {
+        memcpy(s_frame, jpeg, len);
+        s_frame_len = len;
+        s_frame_seq++;
+    }
+    xSemaphoreGive(s_mutex);
 }
 
 static void guard_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "guard task started");
+    uint8_t *decode_buf = NULL;
+    size_t decode_capacity = 0;
+    size_t decode_len = 0;
+    uint8_t *output = heap_caps_aligned_alloc(64, CAM_PREVIEW_BYTES,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint32_t last_seq = 0;
+    uint32_t last_analyze = 0;
 
-    /* PPA output buffer: 64-byte aligned PSRAM (required by ppa_core). */
-    size_t out_size = CAM_PREVIEW_W * CAM_PREVIEW_H * 2;
-    uint8_t *out = (uint8_t *)heap_caps_aligned_alloc(64, out_size,
-                                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (out == NULL) {
-        ESP_LOGE(TAG, "guard out buf alloc failed");
+    ESP_LOGI(TAG, "guard task started");
+    if (output == NULL) {
+        ESP_LOGE(TAG, "guard output buffer allocation failed");
         s_exited = true;
+        s_task = NULL;
         vTaskDelete(NULL);
         return;
     }
 
-    uint32_t last_seq = 0;
-    uint32_t last_analyze = 0;
     while (s_running) {
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        xSemaphoreTake(s_mtx, portMAX_DELAY);
-        bool has = (s_frame != NULL && s_frame_len >= (size_t)(GUARD_SRC_W * GUARD_SRC_H * 2));
-        uint32_t seq = s_frame_seq;
-        xSemaphoreGive(s_mtx);
-        if (!has || seq == last_seq) {
+        if (!copy_pending_frame(&decode_buf, &decode_capacity, &decode_len, &last_seq)) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        last_seq = seq;
 
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         if (now - last_analyze < GUARD_ANALYZE_MS) {
+            vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
         last_analyze = now;
 
-        xSemaphoreTake(s_mtx, portMAX_DELAY);
-        uint8_t *yuv = s_frame;
-        size_t len = s_frame_len;
-        xSemaphoreGive(s_mtx);
-
-        if (len >= (size_t)(GUARD_SRC_W * GUARD_SRC_H * 2) &&
-            app_camera_preview_process(yuv, GUARD_SRC_W, GUARD_SRC_H, out) == ESP_OK) {
-            app_vision_lite_feed_rgb565(out, CAM_PREVIEW_W, CAM_PREVIEW_H, now);
+        if (app_camera_preview_process(decode_buf, decode_len, output) == ESP_OK) {
+            app_vision_lite_feed_rgb565(output, CAM_PREVIEW_W, CAM_PREVIEW_H, now);
         }
-        vTaskDelay(pdMS_TO_TICKS(GUARD_ANALYZE_MS / 2));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
-    heap_caps_free(out);
-    if (xSemaphoreTake(s_mtx, 0) == pdTRUE) {
-        if (s_frame) {
-            heap_caps_free(s_frame);
-            s_frame = NULL;
-        }
-        s_frame_len = 0;
-        xSemaphoreGive(s_mtx);
-    }
+    heap_caps_free(decode_buf);
+    heap_caps_free(output);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    heap_caps_free(s_frame);
+    s_frame = NULL;
+    s_frame_capacity = 0;
+    s_frame_len = 0;
+    xSemaphoreGive(s_mutex);
     s_exited = true;
+    s_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -139,16 +151,18 @@ esp_err_t app_guard_mode_start(void)
     if (s_running) {
         return ESP_OK;
     }
-    if (s_mtx == NULL) {
-        s_mtx = xSemaphoreCreateMutex();
-        if (s_mtx == NULL) {
+    if (s_mutex == NULL) {
+        s_mutex = xSemaphoreCreateMutex();
+        if (s_mutex == NULL) {
             return ESP_ERR_NO_MEM;
         }
     }
 
-    app_activity_camera_acquire(APP_ACT_CAMERA_GUARD);   /* demand-driven start */
-
-    app_vision_lite_init();
+    esp_err_t ret = app_vision_lite_init();
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    app_activity_camera_acquire(APP_ACT_CAMERA_GUARD);
     app_vision_lite_set_enabled(true);
 
     s_running = true;
@@ -157,17 +171,24 @@ esp_err_t app_guard_mode_start(void)
     s_last_active_ms = 0;
     s_absent_start_ms = 0;
 
-    app_camera_register_yuv_cb(on_yuv, NULL);
+    ret = app_camera_register_frame_cb(on_frame, NULL);
+    if (ret != ESP_OK) {
+        s_running = false;
+        app_vision_lite_set_enabled(false);
+        app_activity_camera_release(APP_ACT_CAMERA_GUARD);
+        return ret;
+    }
 
-    BaseType_t t = xTaskCreatePinnedToCoreWithCaps(guard_task, "guard", GUARD_STACK, NULL,
-                                                   3, &s_task, 0, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (t != pdPASS) {
+    BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(
+        guard_task, "guard", GUARD_STACK, NULL, 3, &s_task, 0,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "guard task create failed");
-        app_camera_register_yuv_cb(NULL, NULL);
+        app_camera_unregister_frame_cb(on_frame);
         app_vision_lite_set_enabled(false);
         app_activity_camera_release(APP_ACT_CAMERA_GUARD);
         s_running = false;
-        return ESP_FAIL;
+        return ESP_ERR_NO_MEM;
     }
     s_status = GUARD_STATUS_QUIET;
     ESP_LOGI(TAG, "guard mode started");
@@ -180,21 +201,21 @@ esp_err_t app_guard_mode_stop(void)
         return ESP_OK;
     }
     s_running = false;
-    app_camera_register_yuv_cb(NULL, NULL);
+    app_camera_unregister_frame_cb(on_frame);
     app_vision_lite_set_enabled(false);
 
-    int guard = 0;
-    while (!s_exited && guard++ < 50) {
+    int wait_count = 0;
+    while (!s_exited && wait_count++ < 150) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     s_task = NULL;
     s_exited = false;
 
-    app_activity_camera_release(APP_ACT_CAMERA_GUARD);   /* stop on demand */
-    if (xSemaphoreTake(s_mtx, portMAX_DELAY) == pdTRUE) {
+    app_activity_camera_release(APP_ACT_CAMERA_GUARD);
+    if (xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
         s_status = GUARD_STATUS_IDLE;
         s_last_ratio = 0;
-        xSemaphoreGive(s_mtx);
+        xSemaphoreGive(s_mutex);
     }
     ESP_LOGI(TAG, "guard mode stopped");
     return ESP_OK;
@@ -209,13 +230,13 @@ guard_info_t app_guard_mode_get_info(void)
 {
     guard_info_t info;
     memset(&info, 0, sizeof(info));
-    if (s_mtx == NULL) {
+    if (s_mutex == NULL) {
         return info;
     }
-    xSemaphoreTake(s_mtx, portMAX_DELAY);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     info.status = s_status;
     info.motion_ratio = s_last_ratio;
     info.absent_ms = s_absent_start_ms;
-    xSemaphoreGive(s_mtx);
+    xSemaphoreGive(s_mutex);
     return info;
 }

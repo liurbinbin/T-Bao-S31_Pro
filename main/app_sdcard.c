@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: Apache-2.0
  *
- * SD card 1-bit SDIO implementation.
+ * SD card 4-bit SDIO implementation.
  */
 #include "app_sdcard.h"
 
@@ -12,16 +12,23 @@
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
-#include "driver/sdmmc_host.h"
 #include "driver/gpio.h"
+#include "driver/sdmmc_host.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "tbao_s31_board.h"
 
 static const char *TAG = "APP_SDCARD";
 
 static bool s_mounted = false;
 static sdmmc_card_t *s_card = NULL;
 
-/* GPIO mapping confirmed by schematic image: DAT0=20, CLK=24, CMD=25 */
+/* GPIO mapping from the T-Bao S31 pin map: D0..D3=20..23, CLK=24, CMD=25. */
 #define SDCARD_PIN_D0  GPIO_NUM_20
+#define SDCARD_PIN_D1  GPIO_NUM_21
+#define SDCARD_PIN_D2  GPIO_NUM_22
+#define SDCARD_PIN_D3  GPIO_NUM_23
 #define SDCARD_PIN_CLK GPIO_NUM_24
 #define SDCARD_PIN_CMD GPIO_NUM_25
 
@@ -49,15 +56,22 @@ esp_err_t app_sdcard_init(void)
         return ESP_OK;
     }
 
+    esp_err_t ret = tbao_s31_board_set_sd_power(true);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SD power enable failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+
     sdmmc_host_t host = SDMMC_HOST_DEFAULT();
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.width = 1;
+    slot_config.width = 4;
     slot_config.clk = SDCARD_PIN_CLK;
     slot_config.cmd = SDCARD_PIN_CMD;
     slot_config.d0  = SDCARD_PIN_D0;
-    slot_config.d1 = GPIO_NUM_NC;
-    slot_config.d2 = GPIO_NUM_NC;
-    slot_config.d3 = GPIO_NUM_NC;
+    slot_config.d1 = SDCARD_PIN_D1;
+    slot_config.d2 = SDCARD_PIN_D2;
+    slot_config.d3 = SDCARD_PIN_D3;
     slot_config.cd = GPIO_NUM_NC;
     slot_config.wp = GPIO_NUM_NC;
 
@@ -67,8 +81,8 @@ esp_err_t app_sdcard_init(void)
         .allocation_unit_size = 16 * 1024,
     };
 
-    esp_err_t ret = esp_vfs_fat_sdmmc_mount(APP_SDCARD_MOUNT_POINT, &host, &slot_config,
-                                            &mount_config, &s_card);
+    ret = esp_vfs_fat_sdmmc_mount(APP_SDCARD_MOUNT_POINT, &host, &slot_config,
+                                   &mount_config, &s_card);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SD card mount failed (%s)", esp_err_to_name(ret));
         return ret;
@@ -127,6 +141,46 @@ int app_sdcard_scan_music(app_sdcard_music_item_t *out_items, int max_items)
     closedir(dir);
 
     ESP_LOGI(TAG, "scanned %d music files", count);
+    return count;
+}
+
+int app_sdcard_scan_video(app_sdcard_video_item_t *out_items, int max_items)
+{
+    if (!s_mounted || out_items == NULL || max_items <= 0) {
+        return 0;
+    }
+
+    DIR *dir = opendir(APP_SDCARD_VIDEO_DIR);
+    if (!dir) {
+        ESP_LOGW(TAG, "cannot open %s", APP_SDCARD_VIDEO_DIR);
+        return 0;
+    }
+
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && count < max_items) {
+        if (ent->d_type != DT_REG && ent->d_type != DT_UNKNOWN) {
+            continue;
+        }
+        if (!(str_ends_with_ignore_case(ent->d_name, ".mp4") ||
+              str_ends_with_ignore_case(ent->d_name, ".avi") ||
+              str_ends_with_ignore_case(ent->d_name, ".mjpeg") ||
+              str_ends_with_ignore_case(ent->d_name, ".mjpg"))) {
+            continue;
+        }
+        /* Video playback uses a POSIX path, unlike the audio simple player's
+         * file:// URI. Keeping the two forms separate avoids confusing either
+         * container parser with a URI. */
+        snprintf(out_items[count].path, sizeof(out_items[count].path),
+                 "%s/%s", APP_SDCARD_VIDEO_DIR, ent->d_name);
+        strncpy(out_items[count].title, ent->d_name,
+                sizeof(out_items[count].title) - 1);
+        out_items[count].title[sizeof(out_items[count].title) - 1] = '\0';
+        count++;
+    }
+    closedir(dir);
+
+    ESP_LOGI(TAG, "scanned %d video files", count);
     return count;
 }
 

@@ -1,88 +1,117 @@
-# ESP32-S31-VoCat 喵伴 · AI 萌宠聊天机器人
+# T-Bao S31 VoCat
 
-> 基于 **ESP32-S31-WROOM-1**（乐鑫 2026 新发布的 RISC-V 双核 320MHz 芯片）的离线唤醒 + 云端对话 AI 萌宠，自带圆形触摸屏、DVP 摄像头、ES8389 音频 codec，并支持 **SD 卡 / 在线音乐播放**。
+AI pet firmware for the **T-Bao S31 / ESP32-S31**. It combines Xiaozhi voice chat, a round touch UI, camera vision, media playback, and motor control in one ESP-IDF application.
 
-English below.
+> Status: the T-Bao S31 board definition, camera/audio/display drivers, and application features are integrated and buildable. Camera PID, PMIC, LCD, touch, audio, and SD-card behavior still require a hardware smoke test.
 
-## 亮点（为什么是 ESP32-S31-VoCat）
+[中文说明](README_cn.md)
 
-- **ESP32-S31 新平台**：RISC-V 双核 320MHz + 硬件 JPEG 编解码 + PPA 2D 加速 + Wi-Fi 6 + BT5.4，算力比传统 S3 更强、功耗更低。
-- **真·萌宠表情**：LVGL 9 + esp_emote_expression 驱动的 360×360 圆形屏表情引擎，20+ 内置表情 + 实时字幕，离线也能卖萌。
-- **离线唤醒 + 云端对话**：ESP-SR 离线唤醒词（你好喵伴 / 你好小智），接入 xiaozhi.me 流式 ASR + LLM + TTS，云端大模型对话。
-- **双模音乐播放**：本地 SD 卡曲目 + **在线音乐搜索播放**（对接公共音乐搜索 API，语音说「播放 XX」即可搜歌播放）。
-- **实时摄像头**：SC101IOT DVP 摄像头 → PPA 硬件缩放预览到圆形屏，支持 Web MJPEG 实时画面（手机浏览器直接看），离线帧差视觉分析（运动/挥手检测、番茄钟守护模式）。
-- **完整控制中心**：音量 / 亮度 / WiFi 重置 / 配网，30s 连不上网自动重进配网。
-- **蓝牙 / MCP**：支持 MCP 工具调用（拍照、控制设备等）。
+## Features
 
-## 硬件
+- **Xiaozhi voice chat**: offline wake words ("你好喵伴" and "你好小智") with WebSocket cloud ASR, LLM, and TTS, plus emote states and live captions.
+- **Round touch UI**: LVGL 9 and `esp_emote_expression` with launcher, dialogue, camera, music, video, game, timer, motion, settings, and about pages.
+- **Camera and vision**: OV2640/OV3660-compatible PARLIO JPEG camera with on-screen preview, HTTP MJPEG `/stream`, JPEG `/snapshot`, recording, lightweight face detection/face following, and guard mode.
+- **Media playback**: local audio/video from microSD; online music search resolves a playable URL from multiple public APIs.
+- **Motion control**: dual motors and a servo with touch, Web, voice/MCP control sources, speed limits, motion sequences, and failsafe handling.
+- **Connectivity and control**: Wi-Fi provisioning, volume/brightness settings, MCP tools, and an HTTP preview service.
 
-| 模块 | 说明 |
+## Hardware
+
+The supported board name is `tbao_s31_board`; its definition is in [`boards/tbao_s31_board`](boards/tbao_s31_board).
+
+| Module | Configuration |
 | --- | --- |
-| 主控 | ESP32-S31-WROOM-1（RISC-V 双核 320MHz，Wi-Fi 6 + BT5.4） |
-| 屏幕 | 1.85" 圆形触摸屏 ST77916 360×360（QSPI） |
-| 音频 | ES8389 codec + NS4150B PA（双麦阵列 + 喇叭） |
-| 摄像头 | SC101IOT DVP 摄像头（1280×720） |
-| 存储 | microSD 卡（音乐 / 录像） |
-| 交互 | BMI270 IMU + 触摸手势（上滑/下滑切页） |
+| MCU | ESP32-S31, target `esp32s31`, 16 MB Flash + PSRAM |
+| LCD | ST7796S, approximately 1.54 inch, 320x320, 8-bit PARLIO/I80; data GPIO36/37/38/39/40/42/43/44 |
+| Touch | FT6336/FT6336U at I2C address `0x38`; reset and interrupt are provided by XL9555 |
+| Audio | ES8389 playback + ES7210 dual-microphone capture; I2S GPIO6/7/8/9/10 |
+| Camera | OV2640/OV3660, PARLIO JPEG; SCCB GPIO3/4, RESET GPIO45, XCLK GPIO55, data GPIO46..53, PCLK GPIO54, HREF GPIO57 |
+| Storage | microSD over 4-bit SDMMC: D0..D3 = GPIO20..23, CLK = GPIO24, CMD = GPIO25, mounted at `/sdcard` |
+| Expansion/actuators | XL9555 GPIO expander, dual motor driver, servo output, and LCD backlight PWM |
 
-## 功能一览
+See [`pinmap_cn.md`](pinmap_cn.md) for the complete pin, power, and connector mapping.
 
-- 语音对话：离线唤醒 → 流式 ASR → LLM → TTS，表情随情绪变化。
-- 音乐：SD 卡本地播放 + 在线搜索播放（多端点兜底，自动解析流地址）。
-- 摄像头：实时预览、Web 直播（`/stream` MJPEG、`/snapshot` 抓拍）、离线视觉分析。
-- 页面：表情主页 / 功能桌面 / 对话 / 摄像头 / 音乐 / 游戏 / 番茄钟（含守护模式）。
-- 七夕彩蛋：连续点击功能桌面 5 次触发红心动画。
-- 配网：30 秒连不上自动重进 SoftAP 配网。
+## Requirements
 
-## 构建与烧录
+- ESP-IDF **6.1 or newer**, configured for target `esp32s31`. The repository scripts are written around a 6.2 toolchain environment.
+- Python, CMake, Ninja, and the `riscv32-esp-elf` toolchain supplied by ESP-IDF.
 
-环境：ESP-IDF `master`（`C:\esp-idf-master` 或等价），工具链 `riscv32-esp-elf`。
+Check the environment:
 
 ```bash
-# 1. 拉取组件（首次）
+idf.py --version
+idf.py --list-targets | findstr esp32s31
+```
+
+## Build and flash
+
+Run these commands from the repository root:
+
+```bash
+# Select the target on a fresh checkout
 idf.py set-target esp32s31
-idf.py reconfigure            # 由 idf_component.yml 拉取 managed_components
 
-# 2. 生成板级配置（esp_board_manager）
-idf.py gen-bmgr-config -b esp_vocat_s31_board
+# Resolve managed_components
+idf.py reconfigure
 
-# 3. 编译
+# Generate Board Manager sources from the T-Bao S31 YAML files
+idf.py gen-bmgr-config -b tbao_s31_board
+
+# Build
 idf.py build
 
-# 4. 烧录（921600 波特率更稳定）
-idf.py -p COM12 flash
+# Flash and monitor (replace COM12 with the actual port)
+idf.py -p COM12 -b 921600 flash
 idf.py -p COM12 monitor
 ```
 
-或直接用仓库自带脚本（已配置好本机环境）：
+After changing files under `boards/tbao_s31_board`, run `gen-bmgr-config` again, then reconfigure and build.
 
-```powershell
-.\build_only.ps1        # 仅编译
-.\esptool_flash.ps1     # 编译 + 烧录（COM12, 921600）
+[`build_only.ps1`](build_only.ps1) and [`esptool_flash.ps1`](esptool_flash.ps1) are included for the original local Windows setup. They contain machine-specific ESP-IDF paths, Python paths, and `COM12`; review those values before using them on another machine. The `idf.py` flow above is the portable option.
+
+## SD-card layout
+
+The application mounts the card at `/sdcard`:
+
+| Content | Location |
+| --- | --- |
+| Music | Playable audio files in `/sdcard` |
+| Video | MP4/AVI/MJPEG files in `/sdcard` |
+| Recordings | `/sdcard/record` |
+
+## HTTP preview
+
+After the device joins Wi-Fi, open the device IP at:
+
+- `/` for the preview and device controls
+- `/snapshot` for the current JPEG frame
+- `/stream` for an MJPEG stream (one long-lived viewer)
+
+Use the IP address printed in the serial log.
+
+## Project layout
+
+```text
+main/                         application, pages, camera, audio, motion, and HTTP services
+boards/tbao_s31_board/       T-Bao S31 Board Manager definition
+components/                   local components and board adapters
+managed_components/           ESP-IDF Component Manager dependencies
+patches/                      repeatable patches for managed components
+assets/                       boot splash and UI assets
+docs/                         design and porting notes
+tests/                        Python contract tests
 ```
 
-> 注意：本机 ESP-IDF 工具链版本检查较严格，构建脚本中已设 `IDF_MAINTAINER=1` 把版本检查降级为警告。若改了 `main/boards` 或板级 YAML，需重跑 `gen-bmgr-config` 并同步 `components/gen_bmgr_codes` 生成产物。
+## Tests and validation
 
-## 在线音乐说明
+Run the repository's static contract tests:
 
-在线播放通过 `app_music_online_search()`（`main/page_music.c`）实现：对多个公共音乐搜索 API 发起 HTTPS 请求，用 cJSON 递归解析出第一个可播放的音频流地址，交给 `esp_audio_simple_player` 解码播放。内置多端点兜底（uomg / vvhan / codelife / Meting），哪个网络能通就用哪个。如需更换/新增 API，改 `page_music.c` 里的 `k_music_apis` 数组即可。
+```bash
+python -m unittest discover -s tests -p "test_*.py"
+```
 
----
-
-# ESP32-S31-VoCat · AI Pet Companion
-
-An offline-wake + cloud-chat AI pet built on the **ESP32-S31-WROOM-1** (Espressif's 2026 RISC-V dual-core 320MHz chip), with a round touchscreen, DVP camera, ES8389 audio codec, and **SD-card / online music playback**.
-
-### Highlights
-- **ESP32-S31 platform**: RISC-V dual-core 320MHz, hardware JPEG + PPA 2D accelerator, Wi-Fi 6 + BT5.4.
-- **Pet emotes**: LVGL 9 + esp_emote_expression on a 360×360 round screen (20+ emotes + live subtitles), fully offline.
-- **Offline wake + cloud chat**: ESP-SR wake word → xiaozhi.me streaming ASR + LLM + TTS.
-- **Music**: local SD tracks **and online search-to-play** (voice "play XX" searches and streams).
-- **Camera**: DVP live preview via PPA, Web MJPEG streaming, offline vision analysis.
-- **Control center + MCP**: volume/brightness/WiFi, 30s auto-reprovisioning, MCP tool calls.
-
-### Build
-See the Chinese section above; use `idf.py set-target esp32s31`, `idf.py reconfigure`, `idf.py gen-bmgr-config -b esp_vocat_s31_board`, then `idf.py build flash`.
+A successful build only confirms that the firmware and generated assets can be produced. On first hardware bring-up, also verify camera detection and power rails, LCD/touch orientation, ES8389 playback, ES7210 capture, Wi-Fi provisioning, SD-card I/O, and motor/servo safe stop behavior.
 
 ## License
-Component licenses follow their upstream projects (Espressif esp_xiaozhi, esp_board_manager, LVGL, esp-sr, etc.). Project application code: Apache-2.0.
+
+Application code is Apache-2.0 unless a file states otherwise. Components and model/asset packages retain their upstream licenses; see the corresponding component directories for details.

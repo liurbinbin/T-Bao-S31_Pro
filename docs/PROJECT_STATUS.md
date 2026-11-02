@@ -14,7 +14,7 @@
 |---|---|
 | 工具链 | ESP-IDF **6.2.0** (`C:/esp-idf-master`) |
 | 目标芯片 | **ESP32-S31** (`IDF_TARGET=esp32s31`) |
-| 板级管理 | Espressif `esp_board_manager`（板型 `esp_vocat_s31_board`） |
+| 板级管理 | Espressif `esp_board_manager`（板型 `tbao_s31_board`） |
 | 最新构建 | **成功**（2026-07-24 `Project build complete`） |
 | 产物 | `xiaozhi_chat.bin` = `0x4B5970` (4.9MB)，分区余量 22% |
 | 依赖组件 | esp_xiaozhi、esp_cam_sensor、esp_video、esp_video_codec、esp_codec_dev、esp_board_manager、lvgl 等 |
@@ -74,7 +74,7 @@ ESP32-S31 支持经典/低功耗蓝牙。当前小智走 Wi-Fi 传输语音流�
 3. **固件接入视觉**：用 `esp_cam_sensor` + `esp_video` 初始化摄像头，
    接到小智的"视觉"能力（如拍照/图生文），体现"视觉萌宠"。
 4. **（可选）蓝牙音频 A2DP** 与 **表情动画联动**。
-5. 重新 `idf.py gen-bmgr-config -b esp_vocat_s31_board` → `build flash monitor` 验证。
+5. 使用已提交的 `tbao_s31_board` 板级配置 → `build flash monitor` 验证。
 
 ---
 
@@ -97,3 +97,25 @@ H:\espwork\
 ├── easyeda-api-skill\     # 立创EDA skill 仓库（同源已集成进 WorkBuddy）
 └── walle-tools\           # 既有项目级工具（保留）
 ```
+---
+
+## 6. T-Bao S31 移植记录（2026-10-13）
+
+目标工程：`D:/Code2/esp32-s31-vocat-main`。已根据 `T-Bao-S31/docs/pinmap_cn.md`
+新增独立的 `tbao_s31_board` 板级配置，并完成源码移植和 IDF 6.1 构建验证。
+
+| 项目 | T-Bao S31 配置 |
+|---|---|
+| 摄像头 | OV2640/OV3660 兼容，PARLIO JPEG，320x320 |
+| 摄像头总线 | SCCB I2C1，GPIO3/4；复位 GPIO45；XCLK GPIO55；数据 GPIO46..53；PCLK GPIO54；HREF GPIO57 |
+| 摄像头供电 | SGM38121，主 I2C0，地址 0x28；按 OV2640/OV3660 profile 校验 DVDD |
+| LCD/触摸 | ST7796S 320x320；FT6336U；XL9555 管理触摸复位和电源 |
+| 音频 | ES8389 播放、ES7210 双麦 `MM` 采集 |
+| SD | SDMMC 4-bit，D0..D3=GPIO20..23，CLK=GPIO24，CMD=GPIO25，XL9555 P10 控电 |
+
+已验证：`idf.py build`（ESP-IDF 6.1，`esp32s31`）成功，生成
+`build/xiaozhi_chat.bin`，应用分区余量约 16%。摄像头预览和守护模式使用硬件
+JPEG 解码到 RGB565；HTTP、录制和视觉接口继续使用 JPEG 帧。
+
+未验证：当前尚未连接硬件烧录，因此摄像头 PID、PMIC、LCD、触摸、音频和 SD
+只能视为源码配置完成，仍需上板执行 smoke test。

@@ -16,8 +16,8 @@ extern "C" {
 extern const ui_page_t page_launcher;
 
 /**
- * @brief Create a small "返回" button at the top-left of a feature page root.
- *        Tapping it switches back to the emote face (home).
+ * @brief Create a small home button at the top-left of a feature page root.
+ *        Tapping it switches back to the function launcher.
  *
  * @param[in] root  page root LVGL object
  * @return the button object (or NULL on failure)

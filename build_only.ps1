@@ -2,8 +2,17 @@ $ErrorActionPreference = 'Continue'
 
 $idfPath = 'C:\esp-idf-master'
 $pyEnv   = 'C:\Espressif\python_env\idf6.2_py3.11_env'
-$proj    = 'H:\espwork\esp-projects\vocat-xiaozhi'
+$proj    = $PSScriptRoot
 $log     = Join-Path $proj 'build_only.log'
+
+# Prefer the environment selected by the caller when the historical paths
+# above are not installed on this machine.
+if (-not (Test-Path (Join-Path $idfPath 'tools\idf.py')) -and $env:IDF_PATH) {
+    $idfPath = $env:IDF_PATH
+}
+if (-not (Test-Path (Join-Path $pyEnv 'Scripts\python.exe')) -and $env:IDF_PYTHON_ENV_PATH) {
+    $pyEnv = $env:IDF_PYTHON_ENV_PATH
+}
 
 # NOTE: activate.py --export is broken in this environment (it resolves a
 # non-existent Z:\ESPIDF\... tools path and complains about missing tools), so we
@@ -119,20 +128,85 @@ if ((Test-Path $esRegSrc) -and (Test-Path $esRegPatch)) {
     }
 }
 
-# emote_op: the flashed asset pack has no icon_collection, so the library's
-# icon lookups (EMOTE_ICON_TIPS/MIC/SPEAKER/...) always miss and spam "Not found".
-# Icons are cosmetic overlays; make a missing icon a silent no-op instead of an
-# error so the animated face still renders cleanly. Re-apply from patches/ on
-# re-fetch (component manager can overwrite managed_components).
+# emote_op: keep transient status overlays disabled while showing assistant
+# speech in the EAF toast label. Also keep missing cosmetic icon lookups quiet.
+# Re-apply from patches/ when the component manager refreshes managed_components.
 $emSrc   = Join-Path $proj 'managed_components\espressif2022__esp_emote_expression\src\emote_op.c'
 $emPatch = Join-Path $proj 'patches\espressif2022__esp_emote_expression\src\emote_op.c'
 if ((Test-Path $emSrc) -and (Test-Path $emPatch)) {
-    $cs = Get-Content -Path $emSrc -Raw -Encoding UTF8
-    if ($cs -notmatch 'Icon asset absent from the flashed pack') {
+    $srcHash = (Get-FileHash -Path $emSrc -Algorithm SHA256).Hash
+    $patchHash = (Get-FileHash -Path $emPatch -Algorithm SHA256).Hash
+    if ($srcHash -ne $patchHash) {
         Copy-Item -Path $emPatch -Destination $emSrc -Force
-        Write-Output "[patch] emote_op: missing-icon skip applied from patches/" | Tee-Object -FilePath $log -Append
+        Write-Output "[patch] emote_op: EAF speech bubble applied from patches/" | Tee-Object -FilePath $log -Append
     } else {
-        Write-Output "[patch] emote_op: missing-icon skip already present" | Tee-Object -FilePath $log -Append
+        Write-Output "[patch] emote_op: EAF speech bubble already present" | Tee-Object -FilePath $log -Append
+    }
+}
+
+# emote_init: mark the handle initialized as soon as the gfx display exists so
+# the first flush-complete notification (which can arrive before the default
+# label is created) is not rejected, which used to wedge gfx_render forever.
+$emInitSrc   = Join-Path $proj 'managed_components\espressif2022__esp_emote_expression\src\emote_init.c'
+$emInitPatch = Join-Path $proj 'patches\espressif2022__esp_emote_expression\src\emote_init.c'
+if ((Test-Path $emInitSrc) -and (Test-Path $emInitPatch)) {
+    $srcHash = (Get-FileHash -Path $emInitSrc -Algorithm SHA256).Hash
+    $patchHash = (Get-FileHash -Path $emInitPatch -Algorithm SHA256).Hash
+    if ($srcHash -ne $patchHash) {
+        Copy-Item -Path $emInitPatch -Destination $emInitSrc -Force
+        Write-Output "[patch] emote_init: early-init flush race fix applied from patches/" | Tee-Object -FilePath $log -Append
+    } else {
+        Write-Output "[patch] emote_init: early-init flush race fix already present" | Tee-Object -FilePath $log -Append
+    }
+}
+
+# esp_emote_gfx: keep the label shape/arrow renderer in sync with the managed
+# component.  The component manager may refresh this directory during a build,
+# so compare hashes instead of relying on a one-time marker.
+$gfxRoot = Join-Path $proj 'managed_components\espressif2022__esp_emote_gfx'
+$gfxPatchRoot = Join-Path $proj 'patches\espressif2022__esp_emote_gfx'
+$gfxPatchFiles = @(
+    'include\widget\gfx_label.h',
+    'src\widget\label\gfx_draw_label_priv.h',
+    'src\widget\label\gfx_label_obj.c',
+    'src\widget\label\gfx_label.c',
+    'src\widget\label\gfx_draw_label.c',
+    'src\widget\anim\gfx_anim.c',
+    'src\core\display\gfx_render.c'
+)
+foreach ($relativePath in $gfxPatchFiles) {
+    $gfxSrc = Join-Path $gfxRoot $relativePath
+    $gfxPatch = Join-Path $gfxPatchRoot $relativePath
+    if ((Test-Path $gfxSrc) -and (Test-Path $gfxPatch)) {
+        $srcHash = (Get-FileHash -Path $gfxSrc -Algorithm SHA256).Hash
+        $patchHash = (Get-FileHash -Path $gfxPatch -Algorithm SHA256).Hash
+        if ($srcHash -ne $patchHash) {
+            Copy-Item -Path $gfxPatch -Destination $gfxSrc -Force
+            Write-Output "[patch] esp_emote_gfx ${relativePath}: speech bubble renderer applied" | Tee-Object -FilePath $log -Append
+        }
+    }
+}
+
+# esp_gmf_ai_audio: add the "voice output enabled" gate so the recorder
+# pipeline can be paused while the server TTS plays (mirrors the upstream
+# client's kVoiceProcessingEnabled). Without it the AFE(FEED) ringbuffer
+# overflows and the recorder task starves afe_fetch on the same core.
+$afeSrcRoot = Join-Path $proj 'managed_components\espressif__gmf_ai_audio'
+$afePatchRoot = Join-Path $proj 'patches\espressif__gmf_ai_audio'
+$afePatchFiles = @(
+    'src\esp_gmf_afe.c',
+    'include\esp_gmf_afe.h'
+)
+foreach ($relativePath in $afePatchFiles) {
+    $afeSrc = Join-Path $afeSrcRoot $relativePath
+    $afePatch = Join-Path $afePatchRoot $relativePath
+    if ((Test-Path $afeSrc) -and (Test-Path $afePatch)) {
+        $srcHash = (Get-FileHash -Path $afeSrc -Algorithm SHA256).Hash
+        $patchHash = (Get-FileHash -Path $afePatch -Algorithm SHA256).Hash
+        if ($srcHash -ne $patchHash) {
+            Copy-Item -Path $afePatch -Destination $afeSrc -Force
+            Write-Output "[patch] gmf_ai_audio ${relativePath}: voice-output gate applied" | Tee-Object -FilePath $log -Append
+        }
     }
 }
 
@@ -142,8 +216,9 @@ if ((Test-Path $emSrc) -and (Test-Path $emPatch)) {
 $emSetupSrc   = Join-Path $proj 'managed_components\espressif2022__esp_emote_expression\src\emote_setup.c'
 $emSetupPatch = Join-Path $proj 'patches\espressif2022__esp_emote_expression\src\emote_setup.c'
 if ((Test-Path $emSetupSrc) -and (Test-Path $emSetupPatch)) {
-    $cs = Get-Content -Path $emSetupSrc -Raw -Encoding UTF8
-    if ($cs -notmatch 'vocat patch: 14px 1bpp Puhui Basic') {
+    $srcHash = (Get-FileHash -Path $emSetupSrc -Algorithm SHA256).Hash
+    $patchHash = (Get-FileHash -Path $emSetupPatch -Algorithm SHA256).Hash
+    if ($srcHash -ne $patchHash) {
         Copy-Item -Path $emSetupPatch -Destination $emSetupSrc -Force
         Write-Output "[patch] emote_setup: 14px 1bpp toast font applied from patches/" | Tee-Object -FilePath $log -Append
     } else {
@@ -156,8 +231,9 @@ if ((Test-Path $emSetupSrc) -and (Test-Path $emSetupPatch)) {
 $emYmlSrc   = Join-Path $proj 'managed_components\espressif2022__esp_emote_expression\idf_component.yml'
 $emYmlPatch = Join-Path $proj 'patches\espressif2022__esp_emote_expression\idf_component.yml'
 if ((Test-Path $emYmlSrc) -and (Test-Path $emYmlPatch)) {
-    $cs = Get-Content -Path $emYmlSrc -Raw -Encoding UTF8
-    if ($cs -notmatch '78__xiaozhi-fonts') {
+    $srcHash = (Get-FileHash -Path $emYmlSrc -Algorithm SHA256).Hash
+    $patchHash = (Get-FileHash -Path $emYmlPatch -Algorithm SHA256).Hash
+    if ($srcHash -ne $patchHash) {
         Copy-Item -Path $emYmlPatch -Destination $emYmlSrc -Force
         Write-Output "[patch] emote_expression yml: xiaozhi-fonts dep applied from patches/" | Tee-Object -FilePath $log -Append
     } else {
@@ -194,33 +270,23 @@ if ((Test-Path $viSrc) -and (Test-Path $viPatch)) {
     }
 }
 
-# board_peripherals.yaml: keep the LCD backlight on GPIO46 (EDA netlist BL pin).
-# Putting it on GPIO44 collides with the QSPI D1 data line and leaves the screen
-# dark. The generator reads this YAML, so re-apply it on component re-fetch.
-$bpSrc   = Join-Path $proj 'managed_components\espressif__esp_board_manager\boards\esp_vocat_s31_board\board_peripherals.yaml'
-$bpPatch = Join-Path $proj 'patches\espressif__esp_board_manager\boards\esp_vocat_s31_board\board_peripherals.yaml'
-if ((Test-Path $bpSrc) -and (Test-Path $bpPatch)) {
-    $cs = Get-Content -Path $bpSrc -Raw -Encoding UTF8
-    if ($cs -notmatch 'produces dark/garbage screen') {
-        Copy-Item -Path $bpPatch -Destination $bpSrc -Force
-        Write-Output "[patch] board_peripherals: backlight GPIO46 applied from patches/" | Tee-Object -FilePath $log -Append
-    } else {
-        Write-Output "[patch] board_peripherals: backlight GPIO46 already present" | Tee-Object -FilePath $log -Append
-    }
-}
-
-# board_devices.yaml: keep the LCD power_ctrl LOW-active (P-MOS Q100 gate LOW =
-# ON). The component's default may assert it HIGH, which cuts LCD_3V3 and leaves
-# the screen (and backlight) dark. Re-apply on component re-fetch.
-$bdSrc   = Join-Path $proj 'managed_components\espressif__esp_board_manager\boards\esp_vocat_s31_board\board_devices.yaml'
-$bdPatch = Join-Path $proj 'patches\espressif__esp_board_manager\boards\esp_vocat_s31_board\board_devices.yaml'
-if ((Test-Path $bdSrc) -and (Test-Path $bdPatch)) {
-    $cs = Get-Content -Path $bdSrc -Raw -Encoding UTF8
-    if ($cs -notmatch 'P-MOS is LOW-active') {
-        Copy-Item -Path $bdPatch -Destination $bdSrc -Force
-        Write-Output "[patch] board_devices: lcd_power LOW-active applied from patches/" | Tee-Object -FilePath $log -Append
-    } else {
-        Write-Output "[patch] board_devices: lcd_power LOW-active already present" | Tee-Object -FilePath $log -Append
+# esp_emote_assets: keep the manifest aligned with the nine unique EAF files.
+# The component is managed and may be re-fetched, so restore all resolution
+# manifests from the tracked patches before generating assets.bin.
+$emoteAssetRoot = Join-Path $proj 'managed_components\espressif2022__esp_emote_assets'
+$emotePatchRoot = Join-Path $proj 'patches\espressif2022__esp_emote_assets'
+foreach ($resolution in @('1024_600', '320_240', '360_360')) {
+    $manifestSrc = Join-Path $emoteAssetRoot "$resolution\emote.json"
+    $manifestPatch = Join-Path $emotePatchRoot "$resolution\emote.json"
+    if ((Test-Path $manifestSrc) -and (Test-Path $manifestPatch)) {
+        $srcHash = (Get-FileHash -Path $manifestSrc -Algorithm SHA256).Hash
+        $patchHash = (Get-FileHash -Path $manifestPatch -Algorithm SHA256).Hash
+        if ($srcHash -ne $patchHash) {
+            Copy-Item -Path $manifestPatch -Destination $manifestSrc -Force
+            Write-Output "[patch] emote_assets ${resolution}: nine unique EAF manifest applied" | Tee-Object -FilePath $log -Append
+        } else {
+            Write-Output "[patch] emote_assets ${resolution}: manifest already current" | Tee-Object -FilePath $log -Append
+        }
     }
 }
 

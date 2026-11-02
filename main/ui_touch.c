@@ -16,7 +16,8 @@
 
 static const char *TAG = "UI_TOUCH";
 
-#define TOUCH_POLL_MS   12
+#define TOUCH_POLL_MS   10
+#define TOUCH_RELEASE_DEBOUNCE_SAMPLES 12
 #define TOUCH_STACK     2048
 #define TOUCH_PRIO      6
 
@@ -42,14 +43,56 @@ static bool     s_down = false;
 static int      s_down_x = 0;
 static int      s_down_y = 0;
 static int64_t  s_down_ms = 0;
+static int64_t  s_last_touch_ms = 0;
 static int      s_last_x = 0;
 static int      s_last_y = 0;
 
-/* Latest raw touch position + press state, shared with the LVGL pointer
- * input device (see ui_touch_get_pos). Only this task writes it. */
+typedef struct {
+    int ui_x;
+    int ui_y;
+    int lvgl_x;
+    int lvgl_y;
+} touch_coordinates_t;
+
+/* LVGL receives coordinates before its display rotation. Gestures use the
+ * same logical coordinates as the widgets visible to the user. */
 static volatile int  s_cur_x = -1;
 static volatile int  s_cur_y = -1;
 static volatile bool s_cur_pressed = false;
+
+#if CONFIG_ESP_BOARD_TBAO_S31_BOARD
+static void map_touch_coordinates(int touch_x, int touch_y,
+                                  touch_coordinates_t *coordinates)
+{
+    const int max_x = s_touch != NULL ? (int)s_touch->config.x_max : 319;
+    const int max_y = s_touch != NULL ? (int)s_touch->config.y_max : 319;
+
+    if (touch_x < 0) {
+        touch_x = 0;
+    } else if (touch_x > max_x) {
+        touch_x = max_x;
+    }
+    if (touch_y < 0) {
+        touch_y = 0;
+    } else if (touch_y > max_y) {
+        touch_y = max_y;
+    }
+
+    coordinates->ui_x = touch_y;
+    coordinates->ui_y = touch_x;
+    coordinates->lvgl_x = max_x - touch_x;
+    coordinates->lvgl_y = touch_y;
+}
+#else
+static void map_touch_coordinates(int touch_x, int touch_y,
+                                  touch_coordinates_t *coordinates)
+{
+    coordinates->ui_x = touch_x;
+    coordinates->ui_y = touch_y;
+    coordinates->lvgl_x = touch_x;
+    coordinates->lvgl_y = touch_y;
+}
+#endif
 
 static int64_t now_ms(void)
 {
@@ -85,22 +128,27 @@ static void ui_touch_dispatch_task(void *arg)
 
 static void classify_release(void)
 {
-    int64_t dt = now_ms() - s_down_ms;
+    int64_t dt = s_last_touch_ms - s_down_ms;
+    if (dt < 0) {
+        dt = 0;
+    }
     int dx = s_last_x - s_down_x;
     int dy = s_last_y - s_down_y;
     int adx = dx < 0 ? -dx : dx;
     int ady = dy < 0 ? -dy : dy;
 
     if (dt >= UI_LONG_PRESS_MS && adx < UI_SWIPE_MIN_DIST_PX && ady < UI_SWIPE_MIN_DIST_PX) {
-        emit(UI_GESTURE_LONG_PRESS, s_last_x, s_last_y);
+        emit(UI_GESTURE_LONG_PRESS, s_down_x, s_down_y);
     } else if (adx >= UI_SWIPE_MIN_DIST_PX || ady >= UI_SWIPE_MIN_DIST_PX) {
         if (adx > ady) {
-            emit(dx > 0 ? UI_GESTURE_SWIPE_RIGHT : UI_GESTURE_SWIPE_LEFT, s_last_x, s_last_y);
+            emit(dx > 0 ? UI_GESTURE_SWIPE_RIGHT : UI_GESTURE_SWIPE_LEFT,
+                 s_down_x, s_down_y);
         } else {
-            emit(dy > 0 ? UI_GESTURE_SWIPE_DOWN : UI_GESTURE_SWIPE_UP, s_last_x, s_last_y);
+            emit(dy > 0 ? UI_GESTURE_SWIPE_DOWN : UI_GESTURE_SWIPE_UP,
+                 s_down_x, s_down_y);
         }
     } else if (dt <= UI_TAP_MAX_MS) {
-        emit(UI_GESTURE_TAP, s_last_x, s_last_y);
+        emit(UI_GESTURE_TAP, s_down_x, s_down_y);
     }
 }
 
@@ -108,33 +156,71 @@ static void touch_task(void *arg)
 {
     (void)arg;
     esp_lcd_touch_point_data_t pts[1];
-    uint8_t point_cnt = 0;
+    uint8_t empty_samples = 0;
+    bool read_error_logged = false;
 
     while (s_running) {
         if (s_touch == NULL) {
             vTaskDelay(pdMS_TO_TICKS(TOUCH_POLL_MS));
             continue;
         }
-        esp_lcd_touch_read_data(s_touch);
-        esp_lcd_touch_get_data(s_touch, pts, &point_cnt, 1);
+        uint8_t point_cnt = 0;
+        esp_err_t ret = esp_lcd_touch_read_data(s_touch);
+        if (ret != ESP_OK) {
+            if (!read_error_logged) {
+                ESP_LOGW(TAG, "touch read failed: %s", esp_err_to_name(ret));
+                read_error_logged = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(TOUCH_POLL_MS));
+            continue;
+        }
+        ret = esp_lcd_touch_get_data(s_touch, pts, &point_cnt, 1);
+        if (ret != ESP_OK) {
+            if (!read_error_logged) {
+                ESP_LOGW(TAG, "touch decode failed: %s", esp_err_to_name(ret));
+                read_error_logged = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(TOUCH_POLL_MS));
+            continue;
+        }
+        if (read_error_logged) {
+            ESP_LOGI(TAG, "touch read recovered");
+            read_error_logged = false;
+        }
 
         if (point_cnt > 0) {
-            s_last_x = pts[0].x;
-            s_last_y = pts[0].y;
-            s_cur_x = pts[0].x;
-            s_cur_y = pts[0].y;
+            touch_coordinates_t coordinates;
+            map_touch_coordinates(pts[0].x, pts[0].y, &coordinates);
+            empty_samples = 0;
+            s_last_x = coordinates.ui_x;
+            s_last_y = coordinates.ui_y;
+            s_cur_x = coordinates.lvgl_x;
+            s_cur_y = coordinates.lvgl_y;
             s_cur_pressed = true;
+            s_last_touch_ms = now_ms();
             if (!s_down) {
                 s_down = true;
-                s_down_x = pts[0].x;
-                s_down_y = pts[0].y;
-                s_down_ms = now_ms();
+                s_down_x = coordinates.ui_x;
+                s_down_y = coordinates.ui_y;
+                s_down_ms = s_last_touch_ms;
+                ESP_LOGI(TAG, "touch down: touch=(%d,%d) ui=(%d,%d) lvgl=(%d,%d)",
+                         pts[0].x, pts[0].y,
+                         coordinates.ui_x, coordinates.ui_y,
+                         coordinates.lvgl_x, coordinates.lvgl_y);
             }
         } else if (s_down) {
-            /* Transition from pressed to released. */
-            s_down = false;
+            if (empty_samples < TOUCH_RELEASE_DEBOUNCE_SAMPLES) {
+                ++empty_samples;
+            }
+            if (empty_samples >= TOUCH_RELEASE_DEBOUNCE_SAMPLES) {
+                /* Require consecutive empty samples before releasing. */
+                s_down = false;
+                s_cur_pressed = false;
+                empty_samples = 0;
+                classify_release();
+            }
+        } else {
             s_cur_pressed = false;
-            classify_release();
         }
         vTaskDelay(pdMS_TO_TICKS(TOUCH_POLL_MS));
     }
@@ -192,10 +278,13 @@ void ui_touch_set_callback(ui_touch_cb_t cb)
 void ui_touch_get_pos(int *x, int *y, bool *pressed)
 {
     if (x) {
-        *x = s_cur_pressed ? (int)s_cur_x : -1;
+        /* LVGL also consumes the last point during LV_EVENT_RELEASED. Keep
+         * the coordinate after release so a slider does not recompute from
+         * the synthetic (0, 0) point. */
+        *x = (int)s_cur_x;
     }
     if (y) {
-        *y = s_cur_pressed ? (int)s_cur_y : -1;
+        *y = (int)s_cur_y;
     }
     if (pressed) {
         *pressed = s_cur_pressed;

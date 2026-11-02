@@ -7,11 +7,14 @@ devices:
       sheldonix/esp_io_expander_xl9555: "^0.8.0"
     config:
       max_pins: 16
-      output_io_mask: [1, 5, 7, 8]
-      output_io_level_mask: [1, 1, 1, 1]
+      output_io_mask: [1, 5, 7, 8, 9]
+      output_io_level_mask: [1, 1, 0, 0, 0]
       input_io_mask: [0]
     peripherals:
       - name: i2c_master
+        # Board Manager stores I2C addresses in 8-bit wire encoding. This
+        # value is shifted right by the manager and reaches the XL9555 as the
+        # requested 7-bit runtime address 0x22.
         i2c_addr: [0x44]
 
   - name: lcd_brightness
@@ -76,9 +79,12 @@ devices:
         cs_gpio_num: 19
         data_gpio_nums: [44, 43, 42, 40, 39, 38, 37, 36]
         data_width: 8
-        pclk_hz: 10000000
+        # First throughput step for the ST7796S 8-bit PARLIO bus. Revert to
+        # 10000000 if a particular panel shows signal-integrity artifacts.
+        pclk_hz: 15000000
         clk_src: PARLIO_CLK_SRC_DEFAULT
-        max_transfer_bytes: 10240
+        # One complete 320x320 RGB565 frame per DMA transfer.
+        max_transfer_bytes: 204800
         dma_burst_size: 64
         trans_queue_depth: 10
         lcd_cmd_bits: 8
@@ -115,15 +121,15 @@ devices:
         flags:
           disable_control_phase: true
       touch_config:
-        x_max: 320
-        y_max: 320
+        x_max: 319
+        y_max: 319
         rst_gpio_num: -1
         int_gpio_num: -1
         levels:
           reset: 0
           interrupt: 0
         flags:
-          swap_xy: true
+          swap_xy: false
           mirror_x: true
           mirror_y: false
     peripherals:
@@ -134,6 +140,7 @@ devices:
     type: fs_fat
     sub_type: sdmmc
     version: default
+    init_skip: true
     config:
       mount_point: "/sdcard"
       vfs_config:

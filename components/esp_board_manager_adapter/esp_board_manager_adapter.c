@@ -159,7 +159,11 @@ static esp_err_t calculate_adc_audio_info(esp_board_manager_adapter_info_t *info
         info->sample_bits = 32;
         info->channels = 2;
     } else if (adc_cfg->adc_channel_mask == 0b0011) {
-        memcpy(info->mic_layout, "MR", 2);
+        if (adc_cfg->chip != NULL && strcmp(adc_cfg->chip, "es7210") == 0) {
+            memcpy(info->mic_layout, "MM", 2);
+        } else {
+            memcpy(info->mic_layout, "MR", 2);
+        }
         info->sample_rate = 16000;
         info->sample_bits = 16;
         info->channels = 2;

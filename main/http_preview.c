@@ -31,32 +31,7 @@ static const char *TAG = "http_preview";
  * (~5-6 fps), which is snappy and lets the same httpd task serve everything.
  * /stream is still available for clients that want it (one viewer at a time). */
 static httpd_handle_t s_server = NULL;          /* port 80: / + /snapshot + /stream */
-static SemaphoreHandle_t s_mutex = NULL;
-static uint8_t *s_latest = NULL;
-static size_t s_latest_len = 0;
 static bool s_running = false;
-
-/* Latest frame fed by app_camera's per-frame callback */
-static void on_frame(const uint8_t *jpeg, size_t len, void *ctx)
-{
-    if (jpeg == NULL || len == 0) {
-        return;
-    }
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (s_latest && s_latest_len >= len) {
-        memcpy(s_latest, jpeg, len);
-        s_latest_len = len;
-    } else {
-        uint8_t *nb = heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (nb) {
-            if (s_latest) heap_caps_free(s_latest);
-            s_latest = nb;
-            memcpy(s_latest, jpeg, len);
-            s_latest_len = len;
-        }
-    }
-    xSemaphoreGive(s_mutex);
-}
 
 static esp_err_t stream_handler(httpd_req_t *req)
 {
@@ -80,30 +55,30 @@ static esp_err_t stream_handler(httpd_req_t *req)
         /* Keep the web-viewer lease alive while this persistent stream is open
          * so the activity manager keeps the camera running for us. */
         app_activity_web_touch();
-        xSemaphoreTake(s_mutex, portMAX_DELAY);
-        size_t len = s_latest_len;
-        bool has = (s_latest != NULL && len > 0);
-        xSemaphoreGive(s_mutex);
-        if (!has) {
+        size_t required = 0;
+        uint32_t sequence = 0;
+        esp_err_t info_ret = app_camera_get_latest_jpeg_info(&required, &sequence);
+        if (info_ret != ESP_OK || required == 0) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
         /* Reuse one PSRAM buffer instead of allocating+freeing ~150 KB every
          * frame (malloc churn + fragmentation made the preview stutter). */
-        if (len > cap) {
+        if (required > cap) {
             if (frame) heap_caps_free(frame);
-            frame = heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            cap = frame ? len : 0;
+            frame = heap_caps_malloc(required, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            cap = frame ? required : 0;
         }
         if (frame == NULL) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        xSemaphoreTake(s_mutex, portMAX_DELAY);
-        memcpy(frame, s_latest, s_latest_len);
-        size_t flen = s_latest_len;
-        xSemaphoreGive(s_mutex);
+        size_t flen = 0;
+        if (app_camera_copy_latest_jpeg(frame, cap, &flen, &sequence) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
 
         int n = snprintf(header, sizeof(header),
                          "\r\n--vocat-mjpeg-boundary\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
@@ -145,10 +120,8 @@ static esp_err_t snapshot_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-/* Root page: a polished MJPEG viewer with a one-tap photo button. The <img>
- * points at the dedicated stream server (:81/stream) so the page stays
- * responsive. Photo is taken client-side with fetch() to /snapshot and shown as
- * an overlay thumbnail with a download link. */
+/* Root page: a minimal camera viewer. The <img> is refreshed from /snapshot
+ * so the page stays responsive while the camera is streaming. */
 static esp_err_t root_handler(httpd_req_t *req)
 {
     app_activity_web_touch();   /* opening the viewer page starts the camera */
@@ -158,7 +131,7 @@ static esp_err_t root_handler(httpd_req_t *req)
     static const char html[] =
         "<!DOCTYPE html><html lang=\"zh\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,user-scalable=no\">"
-        "<title>喵伴 · 摄像头</title>"
+        "<title>T-Bao-S31 · 摄像头</title>"
         "<style>"
         "*{box-sizing:border-box;margin:0;padding:0}"
         "body{background:radial-gradient(circle at 50% 0%,#1c2340,#0b0e1a 70%);"
@@ -173,77 +146,18 @@ static esp_err_t root_handler(httpd_req_t *req)
         "#stream{width:100%;height:100%;object-fit:cover;display:block}"
         ".badge{position:absolute;top:12px;left:12px;background:rgba(46,204,113,.92);"
         "color:#04120a;font-size:12px;font-weight:600;padding:4px 10px;border-radius:999px}"
-        ".controls{display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:center}"
-        "button{background:linear-gradient(135deg,#4c8cff,#3a6fd0);border:0;color:#fff;"
-        "font-size:15px;font-weight:600;padding:12px 20px;border-radius:14px;cursor:pointer;"
-        "box-shadow:0 6px 18px rgba(76,140,255,.35)}"
-        "button:active{transform:scale(.95)}button.rec{background:linear-gradient(135deg,#ff5e5e,#d03a3a)}"
-        "a{color:#8fa8ff;font-size:13px;text-decoration:none;margin-top:2px}"
-        "select{background:#1c2340;color:#fff;border:1px solid #2a3355;border-radius:10px;padding:8px 12px;font-size:14px}"
-        ".filebtn{background:linear-gradient(135deg,#4c8cff,#3a6fd0);border:0;color:#fff;"
-        "font-size:15px;font-weight:600;padding:12px 20px;border-radius:14px;cursor:pointer;"
-        "box-shadow:0 6px 18px rgba(76,140,255,.35);display:inline-flex;align-items:center}"
-        "#recStat{font-size:13px;color:#ffb86c}"
-        ".snap{position:absolute;inset:0;display:none;background:rgba(0,0,0,.6);"
-        "align-items:center;justify-content:center;flex-direction:column;gap:12px}"
-        ".snap.show{display:flex}.snap img{width:60%;border-radius:12px;box-shadow:0 8px 30px #000}"
-        ".snap .close{position:absolute;top:14px;right:18px;font-size:26px;cursor:pointer;color:#fff}"
-        ".snap a{background:#2ecc71;color:#04120a;font-weight:700;padding:10px 20px;border-radius:10px}"
         "</style></head><body><div class=\"app\">"
-        "<div class=\"title\">喵伴 <span class=\"dot\">●</span> 摄像头</div>"
+        "<div class=\"title\">T-Bao-S31 <span class=\"dot\">●</span> 摄像头</div>"
         "<div class=\"stage\">"
         "<img id=\"stream\" alt=\"实时画面\">"
         "<span class=\"badge\">● 直播中</span>"
-        "<div id=\"snap\" class=\"snap\"><span class=\"close\" onclick=\"closeSnap()\">&times;</span>"
-        "<img id=\"snapImg\" alt=\"照片\"><a id=\"snapDl\" download=\"maoban.jpg\" href=\"#\">下载照片</a></div>"
         "</div>"
-        "<div class=\"controls\"><button onclick=\"takePhoto()\">📷 拍照</button>"
-        "<a href=\"/snapshot\" target=\"_blank\">原图快照</a></div>"
-        "<div class=\"controls\"><button class=\"rec\" onclick=\"startRec()\">⏺ 录制到SD</button>"
-        "<button onclick=\"stopRec()\">⏹ 停止</button><span id=\"recStat\">未录制</span></div>"
-        "<div class=\"controls\"><select id=\"recList\"></select>"
-        "<button onclick=\"playRec()\">▶ 回放</button><a href=\"/recordings\" target=\"_blank\">列表</a></div>"
-        "<div class=\"controls\"><label class=\"filebtn\">📤 上传到音箱"
-        "<input id=\"file\" type=\"file\" accept=\"audio/*\" onchange=\"onFile(this)\" hidden></label>"
-        "<button onclick=\"sendPlay()\">▶ 播放</button>"
-        "<button class=\"rec\" onclick=\"stopPlay()\">⏹ 停止</button></div>"
-        "<div class=\"controls\"><span id=\"upStat\" style=\"font-size:13px;color:#ffb86c\">选文件后自动上传并播放</span>"
-        "<a href=\"/settings\" style=\"margin-left:auto;background:#222a44;padding:10px 16px;border-radius:12px\">⚙ 音乐设置</a></div>"
         "<script>"
         "const img=document.getElementById('stream');let inflight=false,pre=null;"
         "function loop(){if(inflight)return;inflight=true;"
         "pre=new Image();pre.onload=function(){img.src=pre.src;inflight=false;setTimeout(loop,40)};"
         "pre.onerror=function(){inflight=false;setTimeout(loop,200)};"
         "pre.src='/snapshot?v='+new Date().getTime();}setTimeout(loop,100);"
-        "async function takePhoto(){const b=document.querySelector('.controls button');b.disabled=true;"
-        "try{const r=await fetch('/snapshot');const blob=await r.blob();"
-        "const u=URL.createObjectURL(blob);document.getElementById('snapImg').src=u;"
-        "document.getElementById('snapDl').href=u;"
-        "document.getElementById('snap').classList.add('show')}catch(e){alert('拍照失败')}"
-        "finally{b.disabled=false}}"
-        "function closeSnap(){document.getElementById('snap').classList.remove('show')}"
-        "async function refreshRecList(){try{const r=await fetch('/recordings');const j=await r.json();"
-        "const sel=document.getElementById('recList');sel.innerHTML='';"
-        "j.forEach(x=>{const o=document.createElement('option');o.value=x.name;"
-        "o.textContent=x.name+' ('+x.frames+'帧)';sel.appendChild(o)})}catch(e){}}"
-        "async function startRec(){try{const r=await fetch('/rec/start?fps=5');const j=await r.json();"
-        "document.getElementById('recStat').textContent=j.ok?'录制中…':'启动失败';refreshRecList()}"
-        "catch(e){document.getElementById('recStat').textContent='启动失败'}}"
-        "async function stopRec(){try{await fetch('/rec/stop');"
-        "document.getElementById('recStat').textContent='已停止';refreshRecList()}catch(e){}}"
-        "function playRec(){const n=document.getElementById('recList').value;"
-        "if(n)window.open('/play/'+n,'_blank');}"
-        "let curUrl='';"
-        "function onFile(input){const f=input.files[0];if(!f)return;const st=document.getElementById('upStat');"
-        "st.textContent='上传中… '+f.name;const fd=f;"
-        "fetch('/upload?name='+encodeURIComponent(f.name),{method:'POST',body:fd})"
-        ".then(r=>r.json()).then(j=>{if(j.ok){curUrl=j.url;st.textContent='已上传: '+f.name;"
-        "return fetch('/api/play?url='+encodeURIComponent(j.url));}else{st.textContent='上传失败';}})"
-        ".then(r=>{if(r)return r.json();}).then(j=>{if(j)st.textContent=j.ok?'🎵 播放中: '+f.name:'播放失败';})"
-        ".catch(e=>{st.textContent='上传失败';});}"
-        "async function sendPlay(){if(curUrl){await fetch('/api/play?url='+encodeURIComponent(curUrl));}}"
-        "async function stopPlay(){await fetch('/api/stop');}"
-        "setTimeout(refreshRecList,600);"
         "</script></body></html>";
     httpd_resp_set_type(req, "text/html");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
@@ -299,28 +213,42 @@ static esp_err_t rec_status_handler(httpd_req_t *req)
 
 static esp_err_t recordings_list_handler(httpd_req_t *req)
 {
-    char out[2048];
+    const size_t out_capacity = 2048;
+    char *out = heap_caps_malloc(out_capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *jp = heap_caps_malloc(320, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char *tmp = heap_caps_malloc(512, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (out == NULL || jp == NULL || tmp == NULL) {
+        heap_caps_free(out);
+        heap_caps_free(jp);
+        heap_caps_free(tmp);
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
     int off = 0;
-    off += snprintf(out + off, sizeof(out) - off, "[");
+    off += snprintf(out + off, out_capacity - off, "[");
     if (app_sdcard_mounted()) {
         DIR *d = opendir(APP_SDCARD_RECORD_DIR);
         if (d) {
             struct dirent *ent;
-            while ((ent = readdir(d)) != NULL && off < (int)sizeof(out) - 256) {
+            while ((ent = readdir(d)) != NULL && off < (int)out_capacity - 256) {
                 size_t l = strlen(ent->d_name);
                 if (l < 5 || strcmp(ent->d_name + l - 5, ".json") != 0) {
                     continue;
                 }
-                char jp[320];
-                snprintf(jp, sizeof(jp), "%s/%s", APP_SDCARD_RECORD_DIR, ent->d_name);
+                snprintf(jp, 320, "%s/%s", APP_SDCARD_RECORD_DIR, ent->d_name);
                 FILE *jf = fopen(jp, "r");
                 if (jf) {
-                    char tmp[512];
-                    int rd = fread(tmp, 1, sizeof(tmp) - 1, jf);
+                    int rd = fread(tmp, 1, 511, jf);
                     fclose(jf);
                     if (rd > 0) {
                         tmp[rd] = '\0';
-                        off += snprintf(out + off, sizeof(out) - off, "%s,", tmp);
+                        size_t remaining = out_capacity - (size_t)off;
+                        int written = snprintf(out + off, remaining, "%s,", tmp);
+                        if (written < 0 || (size_t)written >= remaining) {
+                            off = (int)out_capacity - 1;
+                        } else {
+                            off += written;
+                        }
                     }
                 }
             }
@@ -336,6 +264,9 @@ static esp_err_t recordings_list_handler(httpd_req_t *req)
     out[off] = '\0';
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, out, off);
+    heap_caps_free(out);
+    heap_caps_free(jp);
+    heap_caps_free(tmp);
     return ESP_OK;
 }
 
@@ -635,12 +566,19 @@ static esp_err_t settings_handler(httpd_req_t *req)
         "</script></body></html>";
     /* Inject current values into the static template (HTML-attribute safe: the
      * server-side values are alphanumeric/NVS strings, not user HTML). */
-    char page[strlen(html) + sizeof(key) + sizeof(api) + 16];
-    int n = snprintf(page, sizeof(page), html,
+    size_t page_capacity = strlen(html) + sizeof(key) + sizeof(api) + 16;
+    char *page = heap_caps_malloc(page_capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (page == NULL) {
+        httpd_resp_send_500(req);
+        return ESP_OK;
+    }
+    int n = snprintf(page, page_capacity, html,
                      key[0] ? key : "", api[0] ? api : "");
     (void)n;
     httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+    esp_err_t ret = httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
+    heap_caps_free(page);
+    return ret;
 }
 
 static esp_err_t settings_api_handler(httpd_req_t *req)
@@ -699,16 +637,10 @@ esp_err_t http_preview_start(void)
     if (s_running) {
         return ESP_OK;
     }
-    if (s_mutex == NULL) {
-        s_mutex = xSemaphoreCreateMutex();
-    }
-    /* The frame callback only copies frames; it is invoked whenever the camera
-     * pipeline is running (started on demand by the activity manager). */
-    app_camera_register_frame_cb(on_frame, NULL);
-
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.task_priority = 4;
+    config.stack_size = 8192;
     config.max_uri_handlers = 16;
     /* Purge least-recently-used sockets so a stale/abandoned browser tab does
      * not leak a connection and clog the single httpd task (which made the
@@ -717,7 +649,6 @@ esp_err_t http_preview_start(void)
     config.max_open_sockets = 4;
     if (httpd_start(&s_server, &config) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start (80) failed");
-        app_camera_register_frame_cb(NULL, NULL);
         return ESP_FAIL;
     }
     httpd_register_uri_handler(s_server, &s_uri_root);
@@ -751,6 +682,7 @@ esp_err_t http_preview_start(void)
 
 esp_err_t http_preview_stop(void)
 {
+    app_activity_web_release();
     if (!s_running) {
         return ESP_OK;
     }
@@ -759,12 +691,6 @@ esp_err_t http_preview_stop(void)
         httpd_stop(s_server);
         s_server = NULL;
     }
-    app_camera_register_frame_cb(NULL, NULL);
-    if (s_latest) {
-        heap_caps_free(s_latest);
-        s_latest = NULL;
-    }
-    s_latest_len = 0;
     return ESP_OK;
 }
 

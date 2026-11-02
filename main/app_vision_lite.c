@@ -4,7 +4,7 @@
  * app_vision_lite.c — lightweight CPU-only visual analysis (see header).
  *
  * Pipeline per frame (all integer math, no FPU dependency beyond what we avoid):
- *   RGB565 preview (240x240) -> 2x2 box average -> gray 120x120
+ *   RGB565 preview (320x320) -> box average -> gray 120x120
  *   -> |gray - prev_gray| threshold -> motion mask
  *   -> motion_ratio + activity grading + sliding "wave" detector.
  *
@@ -171,45 +171,6 @@ void app_vision_lite_feed_rgb565(const uint8_t *rgb565, int w, int h, uint32_t m
         return;
     }
     rgb565_to_gray(rgb565, w, h, s_buf->gray, VISION_GRAY_W, VISION_GRAY_H);
-    analyze(s_buf->gray, VISION_GRAY_W, VISION_GRAY_H, ms);
-}
-
-/* Downscale UYVY (w x h) to gray gw x gh. UYVY: each 4 bytes = U Y0 V Y1. */
-static void uyvy_to_gray(const uint8_t *uyvy, int w, int h, uint8_t *gray, int gw, int gh)
-{
-    for (int gy = 0; gy < gh; gy++) {
-        int y0 = gy * h / gh;
-        int y1 = (gy + 1) * h / gh;
-        if (y1 <= y0) y1 = y0 + 1;
-        if (y1 > h) y1 = h;
-        for (int gx = 0; gx < gw; gx++) {
-            int x0 = gx * w / gw;
-            int x1 = (gx + 1) * w / gw;
-            if (x1 <= x0) x1 = x0 + 1;
-            if (x1 > w) x1 = w;
-            long sum = 0;
-            int cnt = 0;
-            for (int y = y0; y < y1; y++) {
-                const uint8_t *row = uyvy + (size_t)y * w * 2;
-                for (int x = x0; x < x1; x++) {
-                    /* Even x -> Y after U; odd x -> Y after V. */
-                    int xi = x & ~1;
-                    int yv = row[xi + 1];
-                    sum += yv;
-                    cnt++;
-                }
-            }
-            gray[gy * gw + gx] = (uint8_t)(cnt ? (sum / cnt) : 0);
-        }
-    }
-}
-
-void app_vision_lite_feed_uyvy(const uint8_t *uyvy, int w, int h, uint32_t ms)
-{
-    if (!s_enabled || s_buf == NULL || uyvy == NULL || w <= 0 || h <= 0) {
-        return;
-    }
-    uyvy_to_gray(uyvy, w, h, s_buf->gray, VISION_GRAY_W, VISION_GRAY_H);
     analyze(s_buf->gray, VISION_GRAY_W, VISION_GRAY_H, ms);
 }
 

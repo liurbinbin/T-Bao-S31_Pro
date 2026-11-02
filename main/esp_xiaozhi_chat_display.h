@@ -8,6 +8,7 @@
 
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Forward declaration suffices: this header only returns a pointer to an LVGL
  * object; the full lvgl.h is not required by every TU that includes us. */
@@ -62,6 +63,15 @@ esp_err_t esp_xiaozhi_chat_display_get_height(int *height);
 esp_err_t esp_xiaozhi_chat_display_set_status(const char *status);
 
 /**
+ * @brief  Clear the transient status icon and status/notification text
+ *
+ * @return
+ *       - ESP_OK   On success
+ *       - ESP_ERR_INVALID_STATE   If display not initialized
+ */
+esp_err_t esp_xiaozhi_chat_display_clear_status(void);
+
+/**
  * @brief  Update LCD subtitle text (same as status in current UI)
  *
  * @param[in] subtitle  Subtitle text to display
@@ -82,6 +92,17 @@ esp_err_t esp_xiaozhi_chat_display_set_subtitle(const char *subtitle);
  *       - ESP_ERR_INVALID_STATE   If display not initialized
  */
 esp_err_t esp_xiaozhi_chat_display_set_volume(int volume);
+
+/**
+ * @brief Update the battery icon and charging state.
+ *
+ * @param[in] percent  Estimated percentage, or a negative value when invalid
+ * @param[in] charging Whether the charger reports an active charge phase
+ * @param[in] valid    Whether the sample is valid
+ */
+esp_err_t esp_xiaozhi_chat_display_set_battery(int percent,
+                                               bool charging,
+                                               bool valid);
 
 /**
  * @brief  Update LCD backlight brightness
@@ -118,12 +139,29 @@ esp_err_t esp_xiaozhi_chat_display_set_notification(const char *notification, in
 esp_err_t esp_xiaozhi_chat_display_set_emotion(const char *emotion);
 
 /**
- * @brief  Petting reaction: briefly play the shy/loving emote animation.
+ * @brief  Return whether the animated face is available for idle rotation.
+ */
+bool esp_xiaozhi_chat_display_emote_is_idle(void);
+
+/**
+ * @brief  Select a random animation that differs from the current one.
+ *         Works while listening or speaking; callers should gate passive
+ *         idle rotation separately.
+ *
+ * @return
+ *       - ESP_OK                 A new animation was selected
+ *       - ESP_ERR_INVALID_STATE  Display is not initialized or fewer than two
+ *                                animations are available
+ */
+esp_err_t esp_xiaozhi_chat_display_set_random_emotion(void);
+
+/**
+ * @brief  Petting reaction: briefly play the winking emote animation.
  */
 void esp_xiaozhi_chat_display_pet(void);
 
 /**
- * @brief  Laugh reaction: briefly play the laughing emote animation.
+ * @brief  Laugh reaction: briefly play the happy emote animation.
  */
 void esp_xiaozhi_chat_display_laugh(void);
 
@@ -150,6 +188,17 @@ esp_err_t esp_xiaozhi_chat_display_enable_emote(void);
  * @note   Used by the page manager to switch between the face and page UIs.
  */
 esp_err_t esp_xiaozhi_chat_display_set_face_visible(bool visible);
+
+/**
+ * @brief  Give the video renderer exclusive ownership of the LCD panel.
+ */
+esp_err_t esp_xiaozhi_chat_display_set_video_visible(bool visible);
+
+/**
+ * @brief  Submit one complete RGB565 video frame while video mode is active.
+ */
+esp_err_t esp_xiaozhi_chat_display_present_video_frame(const uint16_t *frame,
+                                                       int width, int height);
 
 /**
  * @brief  Return the LVGL container that PAGE-mode pages build their widgets

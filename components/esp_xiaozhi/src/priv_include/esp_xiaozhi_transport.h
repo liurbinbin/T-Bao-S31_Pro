@@ -82,6 +82,12 @@ esp_err_t esp_xiaozhi_transport_start(esp_xiaozhi_transport_handle_t handle, boo
 esp_err_t esp_xiaozhi_transport_stop(esp_xiaozhi_transport_handle_t handle);
 
 /**
+ * @brief Stop only the current WebSocket session while keeping the transport
+ *        configuration and callbacks available for the next wake.
+ */
+esp_err_t esp_xiaozhi_transport_stop_connection(esp_xiaozhi_transport_handle_t handle);
+
+/**
  * @brief  Send text over the active transport.
  *
  * @param[in] handle  Transport handle

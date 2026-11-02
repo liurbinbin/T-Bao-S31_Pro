@@ -17,6 +17,7 @@ static const char *TAG = "ESP_XIAOZHI_TRANSPORT";
 typedef struct {
     bool use_mqtt;
     bool started;
+    esp_xiaozhi_transport_callbacks_t callbacks;
     esp_xiaozhi_mqtt_handle_t mqtt_handle;
     esp_xiaozhi_websocket_handle_t websocket_handle;
 } esp_xiaozhi_transport_ctx_t;
@@ -38,7 +39,12 @@ esp_err_t esp_xiaozhi_transport_deinit(esp_xiaozhi_transport_handle_t handle)
 
     esp_xiaozhi_transport_ctx_t *ctx = (esp_xiaozhi_transport_ctx_t *)handle;
     if (ctx->started) {
-        esp_xiaozhi_transport_stop(handle);
+        esp_err_t ret = esp_xiaozhi_transport_stop(handle);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Transport deinit deferred until stop succeeds: %s",
+                     esp_err_to_name(ret));
+            return ret;
+        }
     }
     free(ctx);
     return ESP_OK;
@@ -51,7 +57,11 @@ esp_err_t esp_xiaozhi_transport_start(esp_xiaozhi_transport_handle_t handle, boo
     ESP_RETURN_ON_FALSE(callbacks, ESP_ERR_INVALID_ARG, TAG, "Invalid callbacks");
 
     esp_xiaozhi_transport_ctx_t *ctx = (esp_xiaozhi_transport_ctx_t *)handle;
+    if (ctx->started) {
+        return ESP_ERR_INVALID_STATE;
+    }
     ctx->use_mqtt = use_mqtt;
+    ctx->callbacks = *callbacks;
     ctx->started = true;
 
     esp_err_t ret;
@@ -88,16 +98,30 @@ esp_err_t esp_xiaozhi_transport_start(esp_xiaozhi_transport_handle_t handle, boo
             ctx->started = false;
             return ret;
         }
-        ret = esp_xiaozhi_websocket_start(ctx->websocket_handle);
-        if (ret != ESP_OK) {
-            esp_xiaozhi_websocket_deinit(ctx->websocket_handle);
-            ctx->started = false;
-            return ret;
-        }
         ESP_LOGD(TAG, "Transport started with WebSocket");
     }
 
     return ESP_OK;
+}
+
+esp_err_t esp_xiaozhi_transport_stop_connection(esp_xiaozhi_transport_handle_t handle)
+{
+    /* A NULL handle means the connection was already released: the chat stop
+     * path clears mcp_chat_handle after stopping the MCP manager, and deinit
+     * may then close the audio channel again.  Treat that as a no-op so the
+     * teardown stays idempotent; returning ESP_ERR_INVALID_ARG here used to
+     * abort esp_xiaozhi_chat_deinit() before it unregistered the singleton,
+     * which made the next enable fail with "Only one chat instance". */
+    if (handle == 0) {
+        return ESP_OK;
+    }
+
+    esp_xiaozhi_transport_ctx_t *ctx = (esp_xiaozhi_transport_ctx_t *)handle;
+    if (!ctx->started || ctx->use_mqtt || ctx->websocket_handle == 0) {
+        return ESP_OK;
+    }
+
+    return esp_xiaozhi_websocket_stop(ctx->websocket_handle);
 }
 
 esp_err_t esp_xiaozhi_transport_stop(esp_xiaozhi_transport_handle_t handle)
@@ -110,11 +134,29 @@ esp_err_t esp_xiaozhi_transport_stop(esp_xiaozhi_transport_handle_t handle)
     }
 
     if (ctx->use_mqtt) {
-        esp_xiaozhi_mqtt_stop(ctx->mqtt_handle);
-        esp_xiaozhi_mqtt_deinit(ctx->mqtt_handle);
+        esp_err_t ret = esp_xiaozhi_mqtt_stop(ctx->mqtt_handle);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        ret = esp_xiaozhi_mqtt_deinit(ctx->mqtt_handle);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        ctx->mqtt_handle = 0;
     } else {
-        esp_xiaozhi_websocket_stop(ctx->websocket_handle);
-        esp_xiaozhi_websocket_deinit(ctx->websocket_handle);
+        esp_err_t ret = esp_xiaozhi_websocket_stop(ctx->websocket_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to stop WebSocket transport: %s",
+                     esp_err_to_name(ret));
+            return ret;
+        }
+        ret = esp_xiaozhi_websocket_deinit(ctx->websocket_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to deinit WebSocket transport: %s",
+                     esp_err_to_name(ret));
+            return ret;
+        }
+        ctx->websocket_handle = 0;
     }
     ctx->started = false;
 
@@ -127,9 +169,15 @@ esp_err_t esp_xiaozhi_transport_send_text(esp_xiaozhi_transport_handle_t handle,
     ESP_RETURN_ON_FALSE(text, ESP_ERR_INVALID_ARG, TAG, "Invalid text");
 
     esp_xiaozhi_transport_ctx_t *ctx = (esp_xiaozhi_transport_ctx_t *)handle;
+    ESP_RETURN_ON_FALSE(ctx->started, ESP_ERR_INVALID_STATE, TAG,
+                        "Transport not started");
     if (ctx->use_mqtt) {
         return esp_xiaozhi_mqtt_send_text(ctx->mqtt_handle, text);
     } else {
+        esp_err_t ret = esp_xiaozhi_websocket_start(ctx->websocket_handle);
+        if (ret != ESP_OK) {
+            return ret;
+        }
         return esp_xiaozhi_websocket_send_text(ctx->websocket_handle, text);
     }
 }
@@ -140,6 +188,8 @@ esp_err_t esp_xiaozhi_transport_send_binary(esp_xiaozhi_transport_handle_t handl
     ESP_RETURN_ON_FALSE(data, ESP_ERR_INVALID_ARG, TAG, "Invalid data");
 
     esp_xiaozhi_transport_ctx_t *ctx = (esp_xiaozhi_transport_ctx_t *)handle;
+    ESP_RETURN_ON_FALSE(ctx->started, ESP_ERR_INVALID_STATE, TAG,
+                        "Transport not started");
     if (ctx->use_mqtt) {
         return ESP_ERR_NOT_SUPPORTED;
     }

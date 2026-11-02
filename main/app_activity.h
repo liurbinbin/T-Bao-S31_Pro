@@ -9,7 +9,7 @@
  * internal SRAM. This module makes the camera lifecycle demand-driven:
  *
  *   camera runs  <=>  (camera page visible) | (guard mode on) | (recording) |
- *                     (a web viewer is actively polling /stream or /snapshot)
+ *                     (MCP photo capture) | (face follow) | (a web viewer is active)
  *
  * Consumers declare their need with app_activity_camera_acquire()/release()
  * (cheap, non-blocking on the camera). A low-priority task reconciles the
@@ -26,6 +26,8 @@
  */
 #pragma once
 
+#include <stdint.h>
+
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -38,6 +40,8 @@ typedef enum {
     APP_ACT_CAMERA_GUARD = (1 << 1),  /*!< timer "guard mode" is active */
     APP_ACT_CAMERA_WEB   = (1 << 2),  /*!< a web client is viewing (lease-based) */
     APP_ACT_CAMERA_REC   = (1 << 3),  /*!< SD recorder is running */
+    APP_ACT_CAMERA_MCP   = (1 << 4),  /*!< MCP photo capture is active */
+    APP_ACT_CAMERA_FOLLOW = (1 << 5), /*!< offline face-follow mode is active */
 } app_activity_cam_reason_t;
 
 /**
@@ -52,8 +56,14 @@ void app_activity_camera_acquire(app_activity_cam_reason_t r);
 /** @brief  Declare that the given consumer no longer needs the camera. */
 void app_activity_camera_release(app_activity_cam_reason_t r);
 
+/** @brief Wait until the camera task is running after a demand was acquired. */
+esp_err_t app_activity_camera_wait_until_running(uint32_t timeout_ms);
+
 /** @brief  Refresh the web-viewer lease (call from http handlers). */
 void app_activity_web_touch(void);
+
+/** @brief  Immediately revoke the web-viewer lease (call when preview closes). */
+void app_activity_web_release(void);
 
 #ifdef __cplusplus
 }

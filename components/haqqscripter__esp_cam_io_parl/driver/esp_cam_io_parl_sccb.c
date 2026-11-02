@@ -78,7 +78,6 @@ esp_err_t sccb_init(int pin_sda, int pin_scl) {
 #else
     sccb_i2c_port = SCCB_I2C_PORT_DEFAULT;
 #endif
-    sccb_owns_i2c_port = true;
     ESP_LOGI(TAG, "sccb_i2c_port=%d", sccb_i2c_port);
 
     i2c_master_bus_config_t i2c_mst_config = {
@@ -99,38 +98,69 @@ esp_err_t sccb_init(int pin_sda, int pin_scl) {
     esp_err_t ret = i2c_new_master_bus(&i2c_mst_config, &bus_handle);
     ESP_RETURN_ON_ERROR(ret, TAG, "Failed to install SCCB I2C master bus on port %d: %s", sccb_i2c_port, esp_err_to_name(ret));
 
+    /* Only own the port once the bus actually exists, otherwise a later
+     * sccb_deinit() would try to look up a bus that was never created. */
+    sccb_owns_i2c_port = true;
     return ESP_OK;
 }
 
 esp_err_t sccb_deinit(void) {
+    esp_err_t ret = ESP_OK;
+    /* Best effort: remove every device we know about, then forget the table
+     * even if an individual removal failed.  Leaving stale handles behind is
+     * dangerous because the caller may destroy and re-create its I2C bus, at
+     * which point removing those handles is a use-after-free inside the I2C
+     * driver (this corrupted the internal heap on camera restarts). */
     for (uint8_t i = 0; i < device_count; i++) {
-        ESP_RETURN_ON_ERROR(i2c_master_bus_rm_device(devices[i].dev_handle), TAG, "Failed to remove SCCB I2C Device");
-
+        if (devices[i].dev_handle != NULL) {
+            esp_err_t rm_ret = i2c_master_bus_rm_device(devices[i].dev_handle);
+            if (rm_ret != ESP_OK && ret == ESP_OK) {
+                ret = rm_ret;
+                ESP_LOGW(TAG, "Failed to remove SCCB I2C device 0x%02x: %s",
+                         devices[i].address, esp_err_to_name(rm_ret));
+            }
+        }
         devices[i].dev_handle = NULL;
         devices[i].address = 0;
     }
     device_count = 0;
 
     if (!sccb_owns_i2c_port) {
-        return ESP_OK;
+        return ret;
     }
     sccb_owns_i2c_port = false;
 
     i2c_master_bus_handle_t bus_handle;
-    ESP_RETURN_ON_ERROR(i2c_master_get_bus_handle(sccb_i2c_port, &bus_handle), TAG, "failed to get SCCB I2C Bus handle for port %d", sccb_i2c_port);
-    ESP_RETURN_ON_ERROR(i2c_del_master_bus(bus_handle), TAG, "failed to get delete SCCB I2C Master Bus at port %d", sccb_i2c_port);
-
-    return ESP_OK;
+    esp_err_t bus_ret = i2c_master_get_bus_handle(sccb_i2c_port, &bus_handle);
+    if (bus_ret != ESP_OK) {
+        ESP_LOGW(TAG, "failed to get SCCB I2C Bus handle for port %d: %s",
+                 sccb_i2c_port, esp_err_to_name(bus_ret));
+        return ret == ESP_OK ? bus_ret : ret;
+    }
+    esp_err_t del_ret = i2c_del_master_bus(bus_handle);
+    if (del_ret != ESP_OK) {
+        ESP_LOGW(TAG, "failed to delete SCCB I2C Master Bus at port %d: %s",
+                 sccb_i2c_port, esp_err_to_name(del_ret));
+        if (ret == ESP_OK) {
+            ret = del_ret;
+        }
+    }
+    return ret;
 }
 
 esp_err_t sccb_use_port(int i2c_port) {
     // Deinitialize SCCB port if used
     if (sccb_owns_i2c_port) {
-        sccb_deinit();
+        (void)sccb_deinit();
     }
     if (i2c_port < 0 || i2c_port > I2C_NUM_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
+    /* For a caller-owned port we do not know whether the bus behind it is the
+     * same one our cached devices belong to: the caller may have destroyed and
+     * re-created it between camera sessions.  Forget the handles rather than
+     * risk removing a device from a freed bus later. */
+    device_count = 0;
     sccb_i2c_port = i2c_port;
 
     return ESP_OK;

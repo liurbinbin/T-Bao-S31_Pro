@@ -1,14 +1,15 @@
 #include "driver/ledc.h"
+#include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_cam_io_parl_xclk.h"
 #include "esp_cam_sensor_io_parl.h"
 
-#include "esp_log.h"
 static const char* TAG = "esp_cam_io_parl_xclk";
 
 #define NO_CAMERA_LEDC_CHANNEL 0xFF
 static ledc_channel_t g_ledc_channel = NO_CAMERA_LEDC_CHANNEL;
+static gpio_num_t g_ledc_gpio = GPIO_NUM_NC;
 
 esp_err_t xclk_timer_conf(int ledc_timer, int xclk_freq_hz) {
     ledc_timer_config_t timer_conf;
@@ -33,6 +34,7 @@ esp_err_t camera_enable_out_clock(const esp_cam_sensor_io_parl_config_t* config)
     }
 
     g_ledc_channel = config->ledc_channel;
+    g_ledc_gpio = config->xclk_io;
     ledc_channel_config_t ch_conf = {0};
     ch_conf.gpio_num = config->xclk_io;
     ch_conf.speed_mode = LEDC_LOW_SPEED_MODE;
@@ -43,6 +45,7 @@ esp_err_t camera_enable_out_clock(const esp_cam_sensor_io_parl_config_t* config)
     err = ledc_channel_config(&ch_conf);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ledc_channel_config failed, rc=%x", err);
+        camera_disable_out_clock();
         return err;
     }
     return ESP_OK;
@@ -50,7 +53,11 @@ esp_err_t camera_enable_out_clock(const esp_cam_sensor_io_parl_config_t* config)
 
 void camera_disable_out_clock() {
     if (g_ledc_channel != NO_CAMERA_LEDC_CHANNEL) {
-        ledc_stop(LEDC_LOW_SPEED_MODE, g_ledc_channel, 0);
+        (void)ledc_stop(LEDC_LOW_SPEED_MODE, g_ledc_channel, 0);
         g_ledc_channel = NO_CAMERA_LEDC_CHANNEL;
+    }
+    if (g_ledc_gpio >= 0) {
+        (void)gpio_reset_pin(g_ledc_gpio);
+        g_ledc_gpio = GPIO_NUM_NC;
     }
 }

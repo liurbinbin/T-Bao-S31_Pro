@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-/* Mini-game page (placeholder skeleton: snake / tetris list). */
+/* Mini-game page. */
 extern const ui_page_t page_game;
 
 #ifdef __cplusplus

@@ -14,12 +14,15 @@ extern "C" {
 
 #define APP_SDCARD_MOUNT_POINT "/sdcard"
 #define APP_SDCARD_MUSIC_DIR     "/sdcard"
+#define APP_SDCARD_VIDEO_DIR     "/sdcard"
 #define APP_SDCARD_RECORD_DIR    "/sdcard/record"
 
 typedef struct {
     char path[300];   /* playable URI, e.g. "file://sdcard/song.mp3" */
     char title[128];  /* display name (file name) */
 } app_sdcard_music_item_t;
+
+typedef app_sdcard_music_item_t app_sdcard_video_item_t;
 
 /**
  * @brief  Mount the SD card to /sdcard using 1-bit SDIO.
@@ -43,6 +46,11 @@ const char *app_sdcard_mount_point(void);
  * @return number of files found
  */
 int app_sdcard_scan_music(app_sdcard_music_item_t *out_items, int max_items);
+
+/**
+ * @brief  Scan the SD card root for MP4/AVI/MJPEG video files.
+ */
+int app_sdcard_scan_video(app_sdcard_video_item_t *out_items, int max_items);
 
 /**
  * @brief  Ensure /sdcard/record directory exists.

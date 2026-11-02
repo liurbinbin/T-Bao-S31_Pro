@@ -7,7 +7,8 @@
  */
 #pragma once
 
-#include <stdint.h>
+#include <stdbool.h>
+
 #include "esp_err.h"
 #include "esp_codec_dev.h"
 
@@ -28,6 +29,9 @@ typedef enum {
  *         Called by chat_app once the audio pipeline is up.
  */
 void app_sfx_set_play_dev(esp_codec_dev_handle_t play_dev, int sample_rate);
+
+void app_sfx_set_enabled(bool enabled);
+bool app_sfx_is_enabled(void);
 
 /**
  * @brief  Play a named effect. No-op if the play device is not registered.

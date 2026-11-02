@@ -127,7 +127,7 @@ esp_err_t app_recorder_stop(void)
     if (jf) {
         int fps = (s_interval > 0) ? (REC_SRC_FPS / s_interval) : REC_SRC_FPS;
         fprintf(jf,
-                "{\"name\":\"%s\",\"frames\":%d,\"fps\":%d,\"size\":%ld,\"width\":1280,\"height\":720}",
+                 "{\"name\":\"%s\",\"frames\":%d,\"fps\":%d,\"size\":%ld,\"width\":320,\"height\":320}",
                 s_name, frames, fps, size);
         fclose(jf);
     }

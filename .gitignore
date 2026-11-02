@@ -1,18 +1,22 @@
 # Build artifacts
 build/
+build_s31/
 managed_components/
 dependencies.lock
-
+.superpowers/
 # ESP-IDF generated
 sdkconfig.old
 sdkconfig.bootloader.old
 *.bin.tmp
-
+tools/
+docs/
 # Logs / temp / debug dumps
 *.log
 *.err
 *.out
 *.gif
+!assets/welcome.gif
+!assets/welcome_boot.gif
 *.pem
 _tmp_*
 _cap*

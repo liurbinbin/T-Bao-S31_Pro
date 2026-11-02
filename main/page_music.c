@@ -4,13 +4,13 @@
  * Music player page for the ESP-VoCat-S31 "喵伴".
  *
  * Full player UI (360x360 round screen):
- *   top bar : "♪ 音乐播放器" + Bluetooth icon
- *   cover   : rounded gradient "album art" card
- *   title   : scrolling song name
- *   lyrics  : scrolling lyric line
- *   progress: seek bar + current/total time (simulated, the simple player
- *             has no position query API)
- *   controls: prev / play-pause / next (+ stop on long press of play)
+ *   top bar : shared page title and back control
+ *   main    : disc-style cover placeholder beside title and lyric focus
+ *   progress: thin progress line + current/total time (simulated, the simple
+ *             player has no position query API)
+ *   controls: image-style icon controls, with Font Awesome placeholders until
+ *             dedicated bitmap assets are supplied
+ *   library : hidden SD-card selector opened by a single library button
  *
  * Actual playback is handled by app_music_player (esp_audio_simple_player),
  * which decodes MP3/AAC streams and writes PCM to the ES8389 speaker.
@@ -21,11 +21,13 @@
 #include "esp_timer.h"
 #include "app_sfx.h"
 #include "app_music_player.h"
+#include "app_language.h"
 #include "app_sdcard.h"
 #include "esp_xiaozhi_chat_display.h"
 #include "lvgl.h"
 #include "font_awesome_symbols.h"
 #include "esp_log.h"
+#include "page_launcher.h"
 #include "esp_http_client.h"
 #include <cJSON.h>
 #include <stdlib.h>
@@ -36,28 +38,47 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "ui_page_manager.h"
+#include "ui_page_style.h"
+#include "launcher_icons.h"
+
+LV_FONT_DECLARE(font_awesome_20_4);
+LV_FONT_DECLARE(font_puhui_16_4);
+LV_FONT_DECLARE(font_puhui_20_4);
 
 #define BG      lv_color_black()
 #define FG      lv_color_white()
-#define ACCENT  lv_color_hex(0x3D8BFD)
-#define DIM     lv_color_hex(0x888888)
-#define CARD    lv_color_hex(0x1E1E24)
+#define ACCENT  lv_color_hex(0x24E6A2)
+#define DIM     lv_color_hex(0x71818C)
+#define CARD    lv_color_hex(0x111A21)
+#define LINE    lv_color_hex(0x20343B)
+#define ACCENT_DARK lv_color_hex(0x126B56)
 
 /* Network demo tracks removed per user request — only SD-card music is shown. */
 /* Simulated track length (seconds) used for the progress bar. */
 #define TRACK_LEN_S 210   /* 3:30 */
+#define MUSIC_COVER_SIZE       128
+#define MUSIC_PROGRESS_WIDTH   (LV_HOR_RES - 48)
+#define MUSIC_CONTROL_SIDE_SIZE 44
+#define MUSIC_CONTROL_PLAY_SIZE 54
 
-static lv_obj_t *s_cover = NULL;        /* cover card */
+static lv_obj_t *s_cover = NULL;        /* disc-style cover placeholder */
 static lv_obj_t *s_title = NULL;        /* scrolling song name */
-static lv_obj_t *s_lyric = NULL;        /* scrolling lyric line */
+static lv_obj_t *s_lyric_prev = NULL;   /* muted context lyric line */
+static lv_obj_t *s_lyric = NULL;        /* active lyric/status line */
+static lv_obj_t *s_lyric_next = NULL;   /* muted hint lyric line */
 static lv_obj_t *s_bar = NULL;          /* progress bar */
 static lv_obj_t *s_time = NULL;         /* mm:ss / mm:ss */
 static lv_obj_t *s_bt_icon = NULL;      /* bluetooth status icon */
 static lv_obj_t *s_btn_prev = NULL;
 static lv_obj_t *s_btn_play = NULL;     /* toggles play/pause icon */
 static lv_obj_t *s_btn_next = NULL;
-static lv_obj_t *s_list = NULL;         /* playlist container */
+static lv_obj_t *s_library_button = NULL;
+static lv_obj_t *s_library_panel = NULL;
+static lv_obj_t *s_library_close = NULL;
+static lv_obj_t *s_list = NULL;         /* scrollable playlist container */
 static int s_cur_track = -1;            /* index into the SD-card list */
+
+static void library_hide(void);
 
 /* SD card music list (only source of tracks — network demo tracks removed). */
 #define SD_MAX_ITEMS 8
@@ -90,14 +111,30 @@ static void refresh_state(void)
         if (s_cur_track >= 0 && s_cur_track < s_sd_count) {
             lv_label_set_text(s_title, s_sd_items[s_cur_track].title);
         } else {
-            lv_label_set_text(s_title, "未选择曲目");
+            lv_label_set_text(s_title, app_language_text("未选择曲目", "No track selected"));
+        }
+    }
+    if (st != s_last_st || s_cur_track != s_last_preset) {
+        if (s_lyric_prev) {
+            lv_label_set_text(s_lyric_prev,
+                              s_cur_track >= 0
+                                  ? app_language_text("本地音乐", "LOCAL MUSIC")
+                                  : app_language_text("音乐播放器", "MUSIC PLAYER"));
+        }
+        if (s_lyric_next) {
+            lv_label_set_text(s_lyric_next,
+                              s_cur_track >= 0
+                                  ? app_language_text("SD 卡 / ES8389", "SD CARD / ES8389")
+                                  : app_language_text("打开曲库选择音乐", "Open the library to choose music"));
         }
     }
     if (s_lyric && (st != s_last_st || s_cur_track != s_last_preset)) {
         if (s_cur_track >= 0) {
-            lv_label_set_text(s_lyric, playing ? "正在播放中…" : "已暂停");
+            lv_label_set_text(s_lyric, playing ?
+                              app_language_text("正在播放中…", "Playing…") :
+                              app_language_text("已暂停", "Paused"));
         } else {
-            lv_label_set_text(s_lyric, "点击下方曲目开始播放");
+            lv_label_set_text(s_lyric, app_language_text("点击曲库选择音乐", "Choose music from the library"));
         }
     }
     if (s_btn_play && st != s_last_st) {
@@ -149,7 +186,7 @@ static void set_track(int idx)
     s_pos_ms = 0;
     if (app_music_player_play(url) != ESP_OK) {
         if (s_lyric) {
-            lv_label_set_text(s_lyric, "播放失败");
+            lv_label_set_text(s_lyric, app_language_text("播放失败", "Playback failed"));
         }
     } else {
         s_play_epoch_ms = esp_timer_get_time() / 1000;
@@ -202,6 +239,7 @@ static void track_cb(lv_event_t *e)
     app_sfx_play(APP_SFX_TAP);
     int idx = (int)(intptr_t)lv_event_get_user_data(e);
     set_track(idx);
+    library_hide();
 }
 
 /* ---- AI / voice music control ------------------------------------------- */
@@ -642,13 +680,13 @@ static void music_search_task(void *arg)
             s_play_epoch_ms = esp_timer_get_time() / 1000;
             if (lvgl_port_lock(1000)) {
                 if (s_title) lv_label_set_text(s_title, name);
-                if (s_lyric) lv_label_set_text(s_lyric, "正在线播放…");
+                if (s_lyric) lv_label_set_text(s_lyric, app_language_text("正在线播放…", "Streaming online…"));
                 lvgl_port_unlock();
             }
         }
     } else {
         if (lvgl_port_lock(1000)) {
-            if (s_lyric) lv_label_set_text(s_lyric, "没找到这首，先放SD卡里的吧");
+            if (s_lyric) lv_label_set_text(s_lyric, app_language_text("没找到这首，先放SD卡里的吧", "Track not found; try music on the SD card"));
             lvgl_port_unlock();
         }
     }
@@ -664,14 +702,14 @@ static void start_online_search(const char *name)
         return;   /* a search is already running */
     }
     if (lvgl_port_lock(1000)) {
-        if (s_lyric) lv_label_set_text(s_lyric, "正在搜索在线歌曲…");
+        if (s_lyric) lv_label_set_text(s_lyric, app_language_text("正在搜索在线歌曲…", "Searching online…"));
         lvgl_port_unlock();
     }
     if (xTaskCreatePinnedToCore(music_search_task, "music_srch", MUSIC_SEARCH_STACK,
                                 NULL, 4, &s_search_task, 1) != pdPASS) {
         s_search_task = NULL;
         if (lvgl_port_lock(1000)) {
-            if (s_lyric) lv_label_set_text(s_lyric, "搜索任务创建失败");
+            if (s_lyric) lv_label_set_text(s_lyric, app_language_text("搜索任务创建失败", "Could not start search"));
             lvgl_port_unlock();
         }
     }
@@ -754,7 +792,7 @@ esp_err_t app_music_play_by_name(const char *name)
     return ESP_OK;
 }
 
-/* Rebuild the 2x2 SD-card playlist buttons. */
+/* Rebuild the vertical SD-card selector inside the hidden library panel. */
 static void build_playlist(void)
 {
     if (s_list == NULL) {
@@ -764,50 +802,113 @@ static void build_playlist(void)
     lv_obj_clean(s_list);
 
     int n = cur_list_count();
-    int show = (n > 4) ? 4 : n;   /* 2x2 grid, show first 4 */
-    for (int i = 0; i < show; i++) {
+    for (int i = 0; i < n; i++) {
         const char *name = s_sd_items[i].title;
         lv_obj_t *b = lv_btn_create(s_list);
-        lv_obj_set_size(b, 100, 26);
-        lv_obj_set_style_radius(b, 13, 0);
-        lv_obj_set_style_bg_color(b, CARD, 0);
-        lv_obj_set_style_bg_color(b, ACCENT, LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(b, 0, 0);
+        bool selected = (i == s_cur_track);
+        lv_obj_set_size(b, LV_HOR_RES - 40, 42);
+        lv_obj_set_style_radius(b, 8, 0);
+        lv_obj_set_style_bg_color(b, selected ? ACCENT_DARK : CARD, 0);
+        lv_obj_set_style_bg_color(b, ACCENT_DARK, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(b, 1, 0);
+        lv_obj_set_style_border_color(b, LINE, 0);
+        lv_obj_set_style_border_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_shadow_width(b, 0, 0);
+        lv_obj_set_style_pad_all(b, 4, 0);
         lv_obj_add_event_cb(b, track_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+        lv_obj_t *icon = lv_label_create(b);
+        lv_label_set_text(icon, FONT_AWESOME_MUSIC);
+        lv_obj_set_style_text_font(icon, &font_awesome_20_4, 0);
+        lv_obj_set_style_text_color(icon, ACCENT, 0);
+        lv_obj_align(icon, LV_ALIGN_LEFT_MID, 10, 0);
+
         lv_obj_t *l = lv_label_create(b);
         /* trim long SD filenames for display */
         char disp[32];
         strncpy(disp, name, sizeof(disp) - 1);
         disp[sizeof(disp) - 1] = '\0';
         lv_label_set_text(l, disp);
-        lv_obj_set_style_text_color(l, FG, 0);
-        lv_obj_center(l);
-    }
-    if (n > 4) {
-        lv_obj_t *more = lv_label_create(s_list);
-        lv_label_set_text_fmt(more, "…还有 %d 首", n - 4);
-        lv_obj_set_style_text_color(more, DIM, 0);
+        lv_obj_set_width(l, LV_HOR_RES - 92);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(l, &font_puhui_16_4, 0);
+        lv_obj_set_style_text_color(l, selected ? FG : DIM, 0);
+        lv_obj_align(l, LV_ALIGN_LEFT_MID, 40, 0);
     }
     if (n == 0) {
         lv_obj_t *empty = lv_label_create(s_list);
-        lv_label_set_text(empty, "SD卡中没有音乐");
+        lv_label_set_text(empty,
+                          app_language_text("SD卡中没有音乐", "No music on SD card"));
+        lv_obj_set_style_text_font(empty, &font_puhui_16_4, 0);
         lv_obj_set_style_text_color(empty, DIM, 0);
+        lv_obj_set_width(empty, LV_HOR_RES - 40);
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(empty, LV_ALIGN_TOP_MID, 0, 72);
     }
 }
 
-static lv_obj_t *make_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb,
-                          uint32_t bg, int w, int h)
+static void library_hide(void)
+{
+    if (s_library_panel != NULL) {
+        lv_obj_add_flag(s_library_panel, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void library_show(void)
+{
+    if (s_library_panel == NULL) {
+        return;
+    }
+    /* Rebuild on open so the current-track highlight follows prev/next. */
+    build_playlist();
+    lv_obj_clear_flag(s_library_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void library_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    app_sfx_play(APP_SFX_TAP);
+    if (s_library_panel == NULL) {
+        return;
+    }
+    if (lv_obj_has_flag(s_library_panel, LV_OBJ_FLAG_HIDDEN)) {
+        library_show();
+    } else {
+        library_hide();
+    }
+}
+
+static void library_close_cb(lv_event_t *e)
+{
+    (void)e;
+    app_sfx_play(APP_SFX_TAP);
+    library_hide();
+}
+
+static lv_obj_t *make_icon_btn(lv_obj_t *parent, const char *icon,
+                               lv_event_cb_t cb, uint32_t bg,
+                               uint32_t pressed_bg, uint32_t border,
+                               uint32_t icon_color,
+                               int w, int h)
 {
     lv_obj_t *b = lv_btn_create(parent);
     lv_obj_set_size(b, w, h);
     lv_obj_set_style_radius(b, h / 2, 0);
     lv_obj_set_style_bg_color(b, lv_color_hex(bg), 0);
-    lv_obj_set_style_bg_color(b, lv_color_hex(0x3A3A4A), LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(b, 0, 0);
-    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_set_style_bg_color(b, lv_color_hex(pressed_bg), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(border), 0);
+    lv_obj_set_style_border_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(b, 0, 0);
+    lv_obj_set_style_pad_all(b, 0, 0);
+    if (cb != NULL) {
+        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+    }
     lv_obj_t *l = lv_label_create(b);
-    lv_label_set_text(l, txt);
-    lv_obj_set_style_text_color(l, lv_color_white(), 0);
+    lv_label_set_text(l, icon);
+    lv_obj_set_style_text_font(l, &font_awesome_20_4, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(icon_color), 0);
+    lv_obj_set_style_text_opa(l, LV_OPA_COVER, 0);
     lv_obj_center(l);
     return b;
 }
@@ -819,101 +920,191 @@ esp_err_t page_music_on_enter(void)
     if (root == NULL) {
         return ESP_FAIL;
     }
-    lv_obj_set_style_bg_color(root, BG, 0);
-
-    /* --- Top bar: back button + title + bluetooth icon --- */
-    extern lv_obj_t *ui_page_make_back_button(lv_obj_t *);
+    ui_page_style_root(root);
     ui_page_make_back_button(root);
-    lv_obj_t *title = lv_label_create(root);
-    lv_label_set_text(title, FONT_AWESOME_MUSIC "  音乐播放器");
-    lv_obj_set_style_text_color(title, FG, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+    ui_page_make_header_image(root, &launcher_icon_music, "音乐", "音乐播放器");
 
     s_bt_icon = lv_label_create(root);
     lv_label_set_text(s_bt_icon, FONT_AWESOME_BLUETOOTH);
     lv_obj_set_style_text_color(s_bt_icon, DIM, 0);
-    lv_obj_align(s_bt_icon, LV_ALIGN_TOP_RIGHT, -16, 8);
+    lv_obj_set_style_text_font(s_bt_icon, &font_awesome_20_4, 0);
+    lv_obj_align(s_bt_icon, LV_ALIGN_TOP_RIGHT, -12, 44);
 
-    /* --- Cover card (rounded gradient placeholder album art) --- */
+    /* --- Disc-style cover placeholder; bitmap art can replace this later. --- */
     s_cover = lv_obj_create(root);
-    lv_obj_set_size(s_cover, 88, 88);
-    lv_obj_align(s_cover, LV_ALIGN_TOP_MID, 0, 22);
-    lv_obj_set_style_radius(s_cover, 16, 0);
-    lv_obj_set_style_bg_color(s_cover, ACCENT, 0);
-    lv_obj_set_style_bg_grad_color(s_cover, lv_color_hex(0x8E44AD), 0);
-    lv_obj_set_style_bg_grad_dir(s_cover, LV_GRAD_DIR_VER, 0);
-    lv_obj_set_style_border_width(s_cover, 0, 0);
-    lv_obj_t *cv_icon = lv_label_create(s_cover);
+    lv_obj_set_size(s_cover, MUSIC_COVER_SIZE, MUSIC_COVER_SIZE);
+    lv_obj_align(s_cover, LV_ALIGN_TOP_LEFT, 20, 58);
+    lv_obj_set_style_radius(s_cover, MUSIC_COVER_SIZE / 2, 0);
+    lv_obj_set_style_bg_color(s_cover, lv_color_hex(0x0D1820), 0);
+    lv_obj_set_style_bg_opa(s_cover, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_cover, 1, 0);
+    lv_obj_set_style_border_color(s_cover, ACCENT, 0);
+    lv_obj_set_style_border_opa(s_cover, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(s_cover, 14, 0);
+    lv_obj_set_style_shadow_color(s_cover, lv_color_hex(0x0B4B43), 0);
+    lv_obj_set_style_shadow_opa(s_cover, LV_OPA_50, 0);
+
+    lv_obj_t *cv_inner = lv_obj_create(s_cover);
+    lv_obj_set_size(cv_inner, 78, 78);
+    lv_obj_center(cv_inner);
+    lv_obj_set_style_radius(cv_inner, 39, 0);
+    lv_obj_set_style_bg_color(cv_inner, lv_color_hex(0x132C35), 0);
+    lv_obj_set_style_bg_opa(cv_inner, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(cv_inner, 1, 0);
+    lv_obj_set_style_border_color(cv_inner, LINE, 0);
+    lv_obj_set_style_pad_all(cv_inner, 0, 0);
+
+    lv_obj_t *cv_icon = lv_label_create(cv_inner);
     lv_label_set_text(cv_icon, FONT_AWESOME_MUSIC);
-    lv_obj_set_style_text_color(cv_icon, lv_color_white(), 0);
+    lv_obj_set_style_text_font(cv_icon, &font_awesome_20_4, 0);
+    lv_obj_set_style_text_color(cv_icon, ACCENT, 0);
     lv_obj_center(cv_icon);
 
-    /* --- Song name (scrolling) --- */
+    /* --- Song name and three-line lyric focus --- */
     s_title = lv_label_create(root);
     lv_label_set_long_mode(s_title, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(s_title, LV_HOR_RES - 40);
+    lv_obj_set_width(s_title, LV_HOR_RES - 176);
+    lv_obj_set_height(s_title, 30);
+    lv_obj_set_style_text_font(s_title, &font_puhui_20_4, 0);
     lv_obj_set_style_text_color(s_title, FG, 0);
-    lv_obj_align(s_title, LV_ALIGN_TOP_MID, 0, 118);
-    lv_label_set_text(s_title, "未选择曲目");
+    lv_obj_set_style_text_align(s_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_title, LV_ALIGN_TOP_LEFT, 164, 62);
+    lv_label_set_text(s_title, app_language_text("未选择曲目", "No track selected"));
 
-    /* --- Lyric line (scrolling) --- */
+    s_lyric_prev = lv_label_create(root);
+    lv_obj_set_width(s_lyric_prev, LV_HOR_RES - 176);
+    lv_obj_set_height(s_lyric_prev, 18);
+    lv_obj_set_style_text_font(s_lyric_prev, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(s_lyric_prev, DIM, 0);
+    lv_obj_set_style_text_opa(s_lyric_prev, LV_OPA_70, 0);
+    lv_obj_set_style_text_align(s_lyric_prev, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_lyric_prev, LV_ALIGN_TOP_LEFT, 164, 103);
+    lv_label_set_text(s_lyric_prev, "MUSIC PLAYER");
+
     s_lyric = lv_label_create(root);
-    lv_label_set_long_mode(s_lyric, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_width(s_lyric, LV_HOR_RES - 48);
-    lv_obj_set_style_text_color(s_lyric, DIM, 0);
-    lv_obj_align(s_lyric, LV_ALIGN_TOP_MID, 0, 140);
-    lv_label_set_text(s_lyric, "点击下方曲目开始播放");
+    lv_obj_set_width(s_lyric, LV_HOR_RES - 176);
+    lv_obj_set_height(s_lyric, 26);
+    lv_obj_set_style_text_font(s_lyric, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(s_lyric, FG, 0);
+    lv_obj_set_style_text_align(s_lyric, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_lyric, LV_ALIGN_TOP_LEFT, 164, 126);
+    lv_label_set_text(s_lyric, app_language_text("点击曲库选择音乐", "Choose music from the library"));
+
+    s_lyric_next = lv_label_create(root);
+    lv_obj_set_width(s_lyric_next, LV_HOR_RES - 176);
+    lv_obj_set_height(s_lyric_next, 18);
+    lv_obj_set_style_text_font(s_lyric_next, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(s_lyric_next, DIM, 0);
+    lv_obj_set_style_text_opa(s_lyric_next, LV_OPA_70, 0);
+    lv_obj_set_style_text_align(s_lyric_next, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_lyric_next, LV_ALIGN_TOP_LEFT, 164, 158);
+    lv_label_set_text(s_lyric_next, app_language_text("打开曲库选择音乐", "Open the library to choose music"));
 
     /* --- Progress bar --- */
     lv_obj_t *bar_wrap = lv_obj_create(root);
-    lv_obj_set_size(bar_wrap, LV_HOR_RES - 56, 20);
-    lv_obj_align(bar_wrap, LV_ALIGN_TOP_MID, 0, 158);
+    lv_obj_set_size(bar_wrap, MUSIC_PROGRESS_WIDTH, 14);
+    lv_obj_align(bar_wrap, LV_ALIGN_TOP_MID, 0, 194);
     lv_obj_set_style_bg_opa(bar_wrap, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(bar_wrap, 0, 0);
     lv_obj_set_style_pad_all(bar_wrap, 0, 0);
 
     s_bar = lv_bar_create(bar_wrap);
-    lv_obj_set_size(s_bar, LV_HOR_RES - 56, 5);
+    lv_obj_set_size(s_bar, MUSIC_PROGRESS_WIDTH, 4);
     lv_obj_align(s_bar, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_bg_color(s_bar, lv_color_hex(0x3A3A44), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_bar, LINE, LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_bar, ACCENT, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(s_bar, 3, LV_PART_MAIN);
-    lv_obj_set_style_radius(s_bar, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_bar, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_bar, 2, LV_PART_INDICATOR);
     lv_bar_set_range(s_bar, 0, 100);
     lv_bar_set_value(s_bar, 0, LV_ANIM_OFF);
     lv_obj_clear_flag(s_bar, LV_OBJ_FLAG_CLICKABLE);
 
     s_time = lv_label_create(root);
+    lv_obj_set_width(s_time, MUSIC_PROGRESS_WIDTH);
+    lv_obj_set_style_text_font(s_time, &font_puhui_16_4, 0);
     lv_obj_set_style_text_color(s_time, DIM, 0);
-    lv_obj_align(s_time, LV_ALIGN_TOP_MID, 0, 166);
+    lv_obj_set_style_text_align(s_time, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(s_time, LV_ALIGN_TOP_MID, 0, 210);
     lv_label_set_text(s_time, "00:00 / 03:30");
 
     /* --- Transport controls --- */
     lv_obj_t *ctrl = lv_obj_create(root);
-    lv_obj_set_size(ctrl, LV_HOR_RES - 24, 46);
-    lv_obj_align(ctrl, LV_ALIGN_TOP_MID, 0, 182);
+    lv_obj_set_size(ctrl, LV_HOR_RES - 24, 62);
+    lv_obj_align(ctrl, LV_ALIGN_TOP_MID, 0, 230);
     lv_obj_set_flex_flow(ctrl, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(ctrl, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_bg_opa(ctrl, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(ctrl, 0, 0);
     lv_obj_set_style_pad_all(ctrl, 0, 0);
-    lv_obj_set_style_pad_column(ctrl, 22, 0);
+    lv_obj_set_style_pad_column(ctrl, 34, 0);
 
-    s_btn_prev = make_btn(ctrl, FONT_AWESOME_PREV, prev_cb, 0x3A3A44, 40, 40);
-    s_btn_play = make_btn(ctrl, FONT_AWESOME_PLAY, play_cb, 0x2ECC71, 48, 48);
-    s_btn_next = make_btn(ctrl, FONT_AWESOME_NEXT, next_cb, 0x3A3A44, 40, 40);
+    s_btn_prev = make_icon_btn(ctrl, FONT_AWESOME_PREV, prev_cb,
+                               0x0F1D25, 0x173B3E, 0x23545A, 0xFFFFFF,
+                               MUSIC_CONTROL_SIDE_SIZE, MUSIC_CONTROL_SIDE_SIZE);
+    s_btn_play = make_icon_btn(ctrl, FONT_AWESOME_PLAY, play_cb,
+                               0x24E6A2, 0x12B77E, 0x24E6A2, 0x000000,
+                               MUSIC_CONTROL_PLAY_SIZE, MUSIC_CONTROL_PLAY_SIZE);
+    s_btn_next = make_icon_btn(ctrl, FONT_AWESOME_NEXT, next_cb,
+                               0x0F1D25, 0x173B3E, 0x23545A, 0xFFFFFF,
+                               MUSIC_CONTROL_SIDE_SIZE, MUSIC_CONTROL_SIDE_SIZE);
 
-    /* --- Playlist (SD-card tracks only) --- */
-    s_list = lv_obj_create(root);
-    lv_obj_set_size(s_list, 236, 60);
-    lv_obj_align(s_list, LV_ALIGN_TOP_MID, 0, 246);
-    lv_obj_set_flex_flow(s_list, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(s_list, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    /* --- Library button; the track list opens as a separate selector layer. --- */
+    s_library_button = lv_btn_create(root);
+    lv_obj_set_size(s_library_button, LV_HOR_RES - 48, 38);
+    lv_obj_align(s_library_button, LV_ALIGN_TOP_MID, 0, 304);
+    ui_page_style_button(s_library_button, 0x111A21, 0x173B3E, 8);
+    lv_obj_set_layout(s_library_button, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(s_library_button, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_library_button, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_library_button, 8, 0);
+    lv_obj_add_event_cb(s_library_button, library_toggle_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *library_icon = lv_label_create(s_library_button);
+    lv_label_set_text(library_icon, LV_SYMBOL_LIST);
+    lv_obj_set_style_text_font(library_icon, &font_awesome_20_4, 0);
+    lv_obj_set_style_text_color(library_icon, ACCENT, 0);
+
+    lv_obj_t *library_text = lv_label_create(s_library_button);
+    lv_label_set_text(library_text, app_language_text("曲库", "Library"));
+    lv_obj_set_style_text_font(library_text, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(library_text, FG, 0);
+
+    /* --- Library selector layer --- */
+    s_library_panel = lv_obj_create(root);
+    lv_obj_set_size(s_library_panel, LV_HOR_RES - 16, LV_VER_RES - 56);
+    lv_obj_set_pos(s_library_panel, 8, 48);
+    ui_page_style_panel(s_library_panel);
+    lv_obj_set_style_pad_all(s_library_panel, 0, 0);
+    lv_obj_add_flag(s_library_panel, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_library_panel, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *library_title = lv_label_create(s_library_panel);
+    lv_label_set_text(library_title, app_language_text("选择音乐", "Choose music"));
+    lv_obj_set_style_text_font(library_title, &font_puhui_20_4, 0);
+    lv_obj_set_style_text_color(library_title, FG, 0);
+    lv_obj_align(library_title, LV_ALIGN_TOP_LEFT, 14, 10);
+
+    s_library_close = make_icon_btn(s_library_panel, LV_SYMBOL_CLOSE, NULL,
+                                    0x111A21, 0x173B3E,
+                                    0x2A3942, 0xFFFFFF, 36, 36);
+    lv_obj_align(s_library_close, LV_ALIGN_TOP_RIGHT, -12, 8);
+    lv_obj_add_event_cb(s_library_close, library_close_cb,
+                        LV_EVENT_CLICKED, NULL);
+
+    s_list = lv_obj_create(s_library_panel);
+    lv_obj_set_size(s_list, LV_HOR_RES - 40, LV_VER_RES - 132);
+    lv_obj_set_pos(s_list, 12, 58);
+    lv_obj_set_flex_flow(s_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(s_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_list, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_set_style_bg_opa(s_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_list, 0, 0);
+    lv_obj_set_style_shadow_width(s_list, 0, 0);
     lv_obj_set_style_pad_all(s_list, 0, 0);
     lv_obj_set_style_pad_row(s_list, 6, 0);
-    lv_obj_set_style_pad_column(s_list, 10, 0);
 
     s_sd_count = app_sdcard_scan_music(s_sd_items, SD_MAX_ITEMS);
     s_cur_track = -1;
@@ -932,6 +1123,21 @@ esp_err_t page_music_on_exit(void)
      * not keep consuming bandwidth or the speaker while inactive (bandwidth is
      * only used while the music page is actually open). */
     app_music_player_stop();
+    s_cover = NULL;
+    s_title = NULL;
+    s_lyric_prev = NULL;
+    s_lyric = NULL;
+    s_lyric_next = NULL;
+    s_bar = NULL;
+    s_time = NULL;
+    s_bt_icon = NULL;
+    s_btn_prev = NULL;
+    s_btn_play = NULL;
+    s_btn_next = NULL;
+    s_library_button = NULL;
+    s_library_panel = NULL;
+    s_library_close = NULL;
+    s_list = NULL;
     return ESP_OK;
 }
 

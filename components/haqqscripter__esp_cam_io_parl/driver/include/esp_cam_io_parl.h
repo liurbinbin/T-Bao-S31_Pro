@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
 #include "esp_err.h"
 #include "esp_idf_version.h"
 #include "soc/gpio_num.h"
@@ -10,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "driver/parlio_types.h"
 
 #if ESP_IDF_VERSION_MAJOR >= 6
@@ -114,6 +119,16 @@ typedef struct {
     uint32_t end_marker : 1; /*!< Implies that the current buffer is end of image */
 } esp_cam_io_parl_trans_t;
 
+/* PARLIO partial-receive callbacks run from ISR context. Keep the hand-off
+ * descriptors and their backing storage in internal RAM; the JPEG frame itself
+ * is assembled by cam_task and may live in PSRAM. */
+typedef struct {
+    uint8_t slot;
+    uint16_t length;
+} esp_cam_io_parl_chunk_t;
+
+#define ESP_CAM_IO_PARL_CHUNK_COUNT 3
+
 /**
  * @brief esp_cam_io_parl handle struct
  */
@@ -132,6 +147,17 @@ typedef struct esp_cam_io_parl_t {
         int state; /*!< Frame capture state */
     } info; /*!< Frame buffer info */
     QueueHandle_t queue_handle[ESP_CAM_IO_PARL_QUEUE_MAX]; /*!< Queue handle for receiving frames */
+    QueueHandle_t chunk_free_queue;
+    QueueHandle_t chunk_ready_queue;
+    uint8_t *chunk_storage;
+    uint32_t chunk_size;
+    volatile bool chunk_overflow;
+    volatile bool cam_task_stop;
+    volatile bool callback_accepting;
+    volatile uint32_t callback_inflight;
+    volatile bool rx_started;
+    SemaphoreHandle_t cam_task_exit;
+    StaticSemaphore_t cam_task_exit_storage;
     TaskHandle_t cam_task_handle;
     parlio_rx_unit_handle_t rx_unit; /*!< PARLIO RX unit */
     parlio_rx_delimiter_handle_t rx_delimiter; /*!< PARLIO RX delimiter */
@@ -187,6 +213,9 @@ esp_err_t esp_cam_io_parl_set_alloc_size(esp_cam_io_parl_handle_t esp_cam_io_par
  *      - ESP_OK                    Successfully enabled peripherals used by the esp_cam_io_parl handle
  */
 esp_err_t esp_cam_io_parl_enable(esp_cam_io_parl_handle_t esp_cam_io_parl, bool reset_queue);
+
+/** Start PARLIO DMA after the sensor has been fully configured. */
+esp_err_t esp_cam_io_parl_start(esp_cam_io_parl_handle_t esp_cam_io_parl);
 
 /**
  * @brief Disable the esp_cam_io_parl handle and stop receiving frame buffers

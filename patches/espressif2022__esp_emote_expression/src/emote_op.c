@@ -34,6 +34,26 @@ static const char *TAG = "Expression_op";
 
 #define EVENT_TABLE_SIZE (sizeof(event_table) / sizeof(event_table[0]))
 
+/* Speech bubbles use the bundled 14px Puhui glyph advances.  Its line box is
+ * 17px, so keep a little extra vertical room for the baseline and AA pixels.
+ * The display resolution is still read from the emote handle so the layout
+ * works on the 320x320 EAF panel and other configured resolutions. */
+#define EMOTE_SPEECH_BUBBLE_FONT_PX          14
+#define EMOTE_SPEECH_BUBBLE_LINE_HEIGHT      18
+#define EMOTE_SPEECH_BUBBLE_LINE_SPACING     2
+#define EMOTE_SPEECH_BUBBLE_PAD_X            12
+#define EMOTE_SPEECH_BUBBLE_PAD_Y            8
+#define EMOTE_SPEECH_BUBBLE_TEXT_SAFETY_X    4
+#define EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN    10
+#define EMOTE_SPEECH_BUBBLE_SHORT_MAX_CHARS  8
+#define EMOTE_SPEECH_BUBBLE_MEDIUM_MAX_CHARS 20
+#define EMOTE_SPEECH_BUBBLE_MIN_WIDTH        92
+#define EMOTE_SPEECH_BUBBLE_MIN_HEIGHT       48
+#define EMOTE_SPEECH_BUBBLE_ARROW_DEPTH      10
+
+#define EMOTE_SPEECH_BUBBLE_MAX(a, b) ((a) > (b) ? (a) : (b))
+#define EMOTE_SPEECH_BUBBLE_MIN(a, b) ((a) < (b) ? (a) : (b))
+
 // ===== Type Definitions =====
 typedef esp_err_t (*emote_event_handler_t)(emote_handle_t handle, const char *message);
 
@@ -48,13 +68,19 @@ typedef struct {
 static void **emote_get_cache_ptr_by_obj_type(emote_handle_t handle, emote_obj_type_t obj_type);
 static gfx_image_dsc_t *emote_get_img_dsc_by_obj_type(emote_handle_t handle, emote_obj_type_t obj_type);
 static void emote_set_eye_hidden(emote_handle_t handle, bool hidden);
+static void emote_clear_speech_bubble(emote_handle_t handle);
 
 // UI helper functions
 static esp_err_t emote_set_icon_image(emote_handle_t handle, emote_obj_type_t obj_type, const char *name, bool visible);
-static esp_err_t emote_set_label_text(emote_handle_t handle, emote_obj_type_t obj_type, const char *text);
-static esp_err_t emote_set_emoji_animation(emote_handle_t handle, emote_obj_type_t obj_type, const char *name);
 static esp_err_t emote_set_icon_animation(emote_handle_t handle, emote_obj_type_t obj_type,
         const char *name, uint8_t fps, bool loop);
+static esp_err_t emote_set_label_text(emote_handle_t handle, emote_obj_type_t obj_type, const char *text);
+static esp_err_t emote_set_emoji_animation(emote_handle_t handle, emote_obj_type_t obj_type, const char *name);
+static size_t emote_speech_utf8_count(const char *text);
+static int emote_speech_char_width(const char **cursor);
+static void emote_speech_measure(const char *text, int max_width, int *line_count, int *max_line_width);
+static int emote_speech_bubble_height(int line_count, int arrow_depth);
+static int emote_speech_arrow_depth(int width, int height);
 
 // Event handler functions
 static esp_err_t emote_handle_idle_event(emote_handle_t handle, const char *message);
@@ -78,7 +104,129 @@ static const emote_event_entry_t event_table[] = {
     { EMOTE_MGR_EVT_OFF,    emote_handle_off_event,     false  },
 };
 
+static bool s_speech_bubble_right;
+
 // ===== Static Function Implementations =====
+
+static size_t emote_speech_utf8_count(const char *text)
+{
+    size_t count = 0;
+    const char *cursor = text;
+
+    if (!text) {
+        return 0;
+    }
+
+    while (*cursor) {
+        const char *before = cursor;
+        int width = emote_speech_char_width(&cursor);
+        if (cursor == before) {
+            break;
+        }
+        if (width != -1) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static int emote_speech_char_width(const char **cursor)
+{
+    const unsigned char *p;
+    int bytes = 1;
+
+    if (!cursor || !*cursor || **cursor == '\0') {
+        return 0;
+    }
+
+    p = (const unsigned char *)*cursor;
+    if (*p == '\n') {
+        (*cursor)++;
+        return -1;
+    }
+    if (*p < 0x80) {
+        (*cursor)++;
+        if (*p == '\t') {
+            return EMOTE_SPEECH_BUBBLE_FONT_PX;
+        }
+        return *p == ' ' ? EMOTE_SPEECH_BUBBLE_FONT_PX / 2 : EMOTE_SPEECH_BUBBLE_FONT_PX / 2 + 1;
+    }
+    if ((*p & 0xE0) == 0xC0) {
+        bytes = 2;
+    } else if ((*p & 0xF0) == 0xE0) {
+        bytes = 3;
+    } else if ((*p & 0xF8) == 0xF0) {
+        bytes = 4;
+    }
+
+    for (int i = 1; i < bytes; i++) {
+        if (p[i] == '\0' || (p[i] & 0xC0) != 0x80) {
+            bytes = 1;
+            break;
+        }
+    }
+    *cursor += bytes;
+    return EMOTE_SPEECH_BUBBLE_FONT_PX;
+}
+
+static void emote_speech_measure(const char *text, int max_width, int *line_count, int *max_line_width)
+{
+    const char *cursor = text;
+    int lines = 1;
+    int line_width = 0;
+    int widest = 0;
+
+    if (max_width < EMOTE_SPEECH_BUBBLE_FONT_PX) {
+        max_width = EMOTE_SPEECH_BUBBLE_FONT_PX;
+    }
+
+    while (cursor && *cursor) {
+        int char_width = emote_speech_char_width(&cursor);
+        if (char_width == -1) {
+            widest = EMOTE_SPEECH_BUBBLE_MAX(widest, line_width);
+            line_width = 0;
+            lines++;
+            continue;
+        }
+        if (char_width <= 0) {
+            continue;
+        }
+        if (line_width > 0 && line_width + char_width > max_width) {
+            widest = EMOTE_SPEECH_BUBBLE_MAX(widest, line_width);
+            line_width = char_width;
+            lines++;
+        } else {
+            line_width += char_width;
+        }
+    }
+
+    widest = EMOTE_SPEECH_BUBBLE_MAX(widest, line_width);
+    if (line_count) {
+        *line_count = EMOTE_SPEECH_BUBBLE_MAX(lines, 1);
+    }
+    if (max_line_width) {
+        *max_line_width = EMOTE_SPEECH_BUBBLE_MAX(widest, EMOTE_SPEECH_BUBBLE_FONT_PX);
+    }
+}
+
+static int emote_speech_bubble_height(int line_count, int arrow_depth)
+{
+    line_count = EMOTE_SPEECH_BUBBLE_MAX(line_count, 1);
+    arrow_depth = EMOTE_SPEECH_BUBBLE_MAX(arrow_depth, 0);
+    return line_count * EMOTE_SPEECH_BUBBLE_LINE_HEIGHT +
+           (line_count - 1) * EMOTE_SPEECH_BUBBLE_LINE_SPACING +
+           EMOTE_SPEECH_BUBBLE_PAD_Y * 2 + arrow_depth;
+}
+
+static int emote_speech_arrow_depth(int width, int height)
+{
+    int min_dim = EMOTE_SPEECH_BUBBLE_MIN(width, height);
+    if (min_dim < 8) {
+        return 0;
+    }
+    return EMOTE_SPEECH_BUBBLE_MIN(EMOTE_SPEECH_BUBBLE_ARROW_DEPTH,
+                                   EMOTE_SPEECH_BUBBLE_MAX(4, min_dim / 4));
+}
 
 // Helper functions
 static void **emote_get_cache_ptr_by_obj_type(emote_handle_t handle, emote_obj_type_t obj_type)
@@ -148,6 +296,19 @@ static void emote_set_eye_hidden(emote_handle_t handle, bool hidden)
     gfx_emote_unlock(handle->gfx_handle);
 }
 
+static void emote_clear_speech_bubble(emote_handle_t handle)
+{
+    if (!handle) {
+        return;
+    }
+
+    gfx_obj_t *obj = handle->def_objects[EMOTE_DEF_OBJ_LABEL_TOAST].obj;
+    if (obj) {
+        gfx_label_set_text(obj, "");
+        gfx_obj_set_visible(obj, false);
+    }
+}
+
 // UI helper functions
 static esp_err_t emote_set_icon_image(emote_handle_t handle, emote_obj_type_t obj_type, const char *name, bool visible)
 {
@@ -211,8 +372,7 @@ static esp_err_t emote_set_icon_animation(emote_handle_t handle, emote_obj_type_
 
     ret = emote_get_icon_data_by_name(handle, name, &icon);
     if (ret != ESP_OK) {
-        /* Icon asset absent from the flashed pack; the animated face still
-         * renders fine without it, so skip silently instead of erroring. */
+        /* Optional listen artwork may be absent from a reduced asset pack. */
         return ESP_OK;
     }
 
@@ -220,11 +380,13 @@ static esp_err_t emote_set_icon_animation(emote_handle_t handle, emote_obj_type_
     ESP_GOTO_ON_FALSE(obj, ESP_ERR_INVALID_STATE, error, TAG, "Object not found");
 
     cache_ptr = emote_get_cache_ptr_by_obj_type(handle, obj_type);
-    ESP_GOTO_ON_FALSE(cache_ptr, ESP_ERR_INVALID_STATE, error, TAG, "Failed to get cache pointer for object type %d", obj_type);
+    ESP_GOTO_ON_FALSE(cache_ptr, ESP_ERR_INVALID_STATE, error, TAG,
+                     "Failed to get cache pointer for object type %d", obj_type);
 
     gfx_emote_lock(handle->gfx_handle);
     src_data = emote_acquire_data(handle, icon->data, icon->size, cache_ptr);
-    ESP_GOTO_ON_FALSE(src_data, ESP_ERR_INVALID_STATE, error_unlock, TAG, "Failed to acquire animation data");
+    ESP_GOTO_ON_FALSE(src_data, ESP_ERR_INVALID_STATE, error_unlock, TAG,
+                      "Failed to acquire animation data");
 
     gfx_anim_set_src(obj, src_data, icon->size);
     gfx_anim_set_segment(obj, 0, 0xFFFF, fps, loop);
@@ -327,8 +489,10 @@ static esp_err_t emote_handle_idle_event(emote_handle_t handle, const char *mess
 
 static esp_err_t emote_handle_listen_event(emote_handle_t handle, const char *message)
 {
-    (void)message;
     esp_err_t ret = ESP_OK;
+
+    (void)message;
+    emote_clear_speech_bubble(handle);
 
     ret = emote_set_icon_animation(handle, EMOTE_DEF_OBJ_ANIM_LISTEN, EMOTE_ICON_LISTEN, 15, true);
     if (ret != ESP_OK) {
@@ -336,28 +500,145 @@ static esp_err_t emote_handle_listen_event(emote_handle_t handle, const char *me
     }
 
     ret = emote_set_icon_image(handle, EMOTE_DEF_OBJ_ICON_STATUS, EMOTE_ICON_MIC, true);
-
     return ret;
 }
 
 static esp_err_t emote_handle_speak_event(emote_handle_t handle, const char *message)
 {
     esp_err_t ret = ESP_OK;
+    gfx_obj_t *obj = NULL;
+    size_t char_count;
+    int screen_w;
+    int screen_h;
+    int max_width;
+    int line_count = 1;
+    int max_line_width = EMOTE_SPEECH_BUBBLE_FONT_PX;
+    int bubble_width;
+    int bubble_height;
+    int arrow_depth;
+    int text_offset_y;
+    uint8_t align = GFX_ALIGN_TOP_MID;
+    gfx_label_bg_shape_t shape = GFX_LABEL_BG_SHAPE_ROUND_RECT;
+    gfx_label_bg_arrow_t arrow = GFX_LABEL_BG_ARROW_BOTTOM_CENTER;
 
-    ret = emote_set_label_text(handle, EMOTE_DEF_OBJ_LABEL_TOAST, message);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to set label text");
+    ESP_GOTO_ON_FALSE(handle, ESP_ERR_INVALID_ARG, error, TAG, "Invalid parameters");
+
+    obj = handle->def_objects[EMOTE_DEF_OBJ_LABEL_TOAST].obj;
+    ESP_GOTO_ON_FALSE(obj, ESP_ERR_INVALID_STATE, error, TAG, "Toast label not found");
+
+    if (!message || message[0] == '\0') {
+        emote_clear_speech_bubble(handle);
+        return ESP_OK;
     }
 
+    screen_w = handle->h_res > 0 ? handle->h_res : 320;
+    screen_h = handle->v_res > 0 ? handle->v_res : 320;
+    max_width = EMOTE_SPEECH_BUBBLE_MAX(EMOTE_SPEECH_BUBBLE_FONT_PX,
+                                        screen_w - EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN * 2 -
+                                        EMOTE_SPEECH_BUBBLE_PAD_X * 2 -
+                                        EMOTE_SPEECH_BUBBLE_TEXT_SAFETY_X);
+    char_count = emote_speech_utf8_count(message);
+
+    ret = gfx_label_set_text(obj, message);
+    ESP_GOTO_ON_ERROR(ret, error, TAG, "Failed to set speech bubble text");
+
+    /* Short messages use a playful blob in the upper corners.  Alternating
+     * sides keeps repeated replies from covering the same face detail. */
+    if (char_count <= EMOTE_SPEECH_BUBBLE_SHORT_MAX_CHARS) {
+        emote_speech_measure(message, max_width, &line_count, &max_line_width);
+        bubble_width = EMOTE_SPEECH_BUBBLE_MAX(EMOTE_SPEECH_BUBBLE_MIN_WIDTH,
+                                               max_line_width + EMOTE_SPEECH_BUBBLE_PAD_X * 2 +
+                                               EMOTE_SPEECH_BUBBLE_TEXT_SAFETY_X);
+        bubble_width = EMOTE_SPEECH_BUBBLE_MIN(bubble_width,
+                                               screen_w - EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN * 2);
+        bubble_height = EMOTE_SPEECH_BUBBLE_MAX(
+            EMOTE_SPEECH_BUBBLE_MIN_HEIGHT,
+            emote_speech_bubble_height(line_count, EMOTE_SPEECH_BUBBLE_ARROW_DEPTH));
+        shape = GFX_LABEL_BG_SHAPE_BLOB;
+        arrow = s_speech_bubble_right ? GFX_LABEL_BG_ARROW_BOTTOM_LEFT : GFX_LABEL_BG_ARROW_BOTTOM_RIGHT;
+        align = s_speech_bubble_right ? GFX_ALIGN_TOP_RIGHT : GFX_ALIGN_TOP_LEFT;
+        s_speech_bubble_right = !s_speech_bubble_right;
+    } else if (char_count <= EMOTE_SPEECH_BUBBLE_MEDIUM_MAX_CHARS) {
+        emote_speech_measure(message, max_width, &line_count, &max_line_width);
+        bubble_width = EMOTE_SPEECH_BUBBLE_MAX(EMOTE_SPEECH_BUBBLE_MIN_WIDTH + 20,
+                                               max_line_width + EMOTE_SPEECH_BUBBLE_PAD_X * 2 +
+                                               EMOTE_SPEECH_BUBBLE_TEXT_SAFETY_X);
+        bubble_width = EMOTE_SPEECH_BUBBLE_MIN(bubble_width,
+                                               screen_w - EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN * 2);
+        emote_speech_measure(message,
+                             EMOTE_SPEECH_BUBBLE_MAX(EMOTE_SPEECH_BUBBLE_FONT_PX,
+                                                     bubble_width - EMOTE_SPEECH_BUBBLE_PAD_X * 2 -
+                                                     EMOTE_SPEECH_BUBBLE_TEXT_SAFETY_X),
+                             &line_count, &max_line_width);
+        bubble_height = EMOTE_SPEECH_BUBBLE_MAX(
+            EMOTE_SPEECH_BUBBLE_MIN_HEIGHT,
+            emote_speech_bubble_height(line_count, EMOTE_SPEECH_BUBBLE_ARROW_DEPTH));
+        shape = GFX_LABEL_BG_SHAPE_PILL;
+        arrow = GFX_LABEL_BG_ARROW_BOTTOM_CENTER;
+        align = GFX_ALIGN_TOP_MID;
+    } else {
+        bubble_width = EMOTE_SPEECH_BUBBLE_MAX(EMOTE_SPEECH_BUBBLE_FONT_PX + 2,
+                                               screen_w - EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN * 2);
+        bubble_width = EMOTE_SPEECH_BUBBLE_MIN(bubble_width, screen_w);
+        emote_speech_measure(message,
+                             EMOTE_SPEECH_BUBBLE_MAX(EMOTE_SPEECH_BUBBLE_FONT_PX,
+                                                     bubble_width - EMOTE_SPEECH_BUBBLE_PAD_X * 2 -
+                                                     EMOTE_SPEECH_BUBBLE_TEXT_SAFETY_X),
+                             &line_count, &max_line_width);
+        bubble_height = emote_speech_bubble_height(line_count,
+                                                   EMOTE_SPEECH_BUBBLE_ARROW_DEPTH);
+        bubble_height = EMOTE_SPEECH_BUBBLE_MIN(bubble_height,
+                                                EMOTE_SPEECH_BUBBLE_MAX(EMOTE_SPEECH_BUBBLE_MIN_HEIGHT,
+                                                                        screen_h - EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN * 2));
+        shape = GFX_LABEL_BG_SHAPE_ROUND_RECT;
+        arrow = GFX_LABEL_BG_ARROW_TOP_CENTER;
+        align = GFX_ALIGN_BOTTOM_MID;
+    }
+
+    arrow_depth = emote_speech_arrow_depth(bubble_width, bubble_height);
+    if (arrow_depth > 0) {
+        int base_height = emote_speech_bubble_height(line_count, 0);
+        if (arrow == GFX_LABEL_BG_ARROW_TOP_CENTER) {
+            bubble_height = EMOTE_SPEECH_BUBBLE_MIN(
+                EMOTE_SPEECH_BUBBLE_MAX(1,
+                                        screen_h - EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN * 2),
+                base_height + arrow_depth);
+        }
+    }
+
+    gfx_obj_set_size(obj, (uint16_t)bubble_width, (uint16_t)bubble_height);
+    if (align == GFX_ALIGN_TOP_LEFT) {
+        gfx_obj_align(obj, GFX_ALIGN_TOP_LEFT, EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN,
+                      EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN);
+    } else if (align == GFX_ALIGN_TOP_RIGHT) {
+        gfx_obj_align(obj, GFX_ALIGN_TOP_RIGHT, -EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN,
+                      EMOTE_SPEECH_BUBBLE_SCREEN_MARGIN);
+    } else if (align == GFX_ALIGN_BOTTOM_MID) {
+        gfx_obj_align(obj, GFX_ALIGN_BOTTOM_MID, 0, -4);
+    } else {
+        gfx_obj_align(obj, GFX_ALIGN_TOP_MID, 0, 16);
+    }
+
+    gfx_label_set_color(obj, GFX_COLOR_HEX(0x000000u));
+    gfx_label_set_bg_color(obj, GFX_COLOR_HEX(0xFFFFFFu));
+    gfx_label_set_opa(obj, 0xFF);
+    gfx_label_set_bg_enable(obj, true);
+    gfx_label_set_bg_shape(obj, shape);
+    gfx_label_set_bg_arrow(obj, arrow);
+    text_offset_y = EMOTE_SPEECH_BUBBLE_PAD_Y +
+                    (arrow == GFX_LABEL_BG_ARROW_TOP_CENTER ? arrow_depth : 0);
+    gfx_label_set_text_offset(obj, EMOTE_SPEECH_BUBBLE_PAD_X, text_offset_y);
+    gfx_label_set_line_spacing(obj, EMOTE_SPEECH_BUBBLE_LINE_SPACING);
+    gfx_label_set_text_align(obj, GFX_TEXT_ALIGN_CENTER);
+    gfx_label_set_long_mode(obj, GFX_LABEL_LONG_WRAP);
+    gfx_obj_set_visible(obj, true);
     ret = emote_set_icon_image(handle, EMOTE_DEF_OBJ_ICON_STATUS, EMOTE_ICON_SPEAKER, true);
-
-    gfx_obj_t *obj = handle->def_objects[EMOTE_DEF_OBJ_LABEL_TOAST].obj;
-    if (obj) {
-        gfx_emote_lock(handle->gfx_handle);
-        gfx_label_set_snap_loop(obj, false);
-        gfx_emote_unlock(handle->gfx_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set speaker icon");
     }
+    return ret;
 
+error:
     return ret;
 }
 
@@ -374,9 +655,9 @@ static esp_err_t emote_handle_sys_set_event(emote_handle_t handle, const char *m
 
     gfx_obj_t *obj = handle->def_objects[EMOTE_DEF_OBJ_LABEL_TOAST].obj;
     if (obj) {
-        gfx_emote_lock(handle->gfx_handle);
+        /* System notices keep the original plain scrolling label style. */
+        gfx_label_set_bg_enable(obj, false);
         gfx_label_set_snap_loop(obj, true);
-        gfx_emote_unlock(handle->gfx_handle);
     }
 
     return ret;
@@ -384,9 +665,10 @@ static esp_err_t emote_handle_sys_set_event(emote_handle_t handle, const char *m
 
 static esp_err_t emote_handle_off_event(emote_handle_t handle, const char *message)
 {
-    esp_err_t ret = ESP_OK;
+    (void)message;
+    emote_clear_speech_bubble(handle);
     // emote_set_eye_hidden(handle, true);
-    return ret;
+    return ESP_OK;
 }
 
 static esp_err_t emote_handle_bat_event(emote_handle_t handle, const char *message)
@@ -726,7 +1008,12 @@ esp_err_t emote_notify_flush_finished(emote_handle_t handle)
 {
     esp_err_t ret = ESP_OK;
 
-    ESP_GOTO_ON_FALSE(handle && handle->is_initialized, ESP_ERR_INVALID_STATE, error, TAG, "Handle not initialized");
+    /* This callback fires as soon as the display has been added to the gfx
+     * core, which happens before emote_init() finishes creating the default
+     * label.  Gating on is_initialized here rejects the first boot-time flush,
+     * leaving gfx_render blocked on WAIT_FLUSH_DONE forever.  The display
+     * handle is the only thing this notification actually needs. */
+    ESP_GOTO_ON_FALSE(handle, ESP_ERR_INVALID_STATE, error, TAG, "Handle is NULL");
 
     ESP_GOTO_ON_FALSE(handle->gfx_disp, ESP_ERR_INVALID_STATE, error, TAG, "GFX display handle not initialized");
 
