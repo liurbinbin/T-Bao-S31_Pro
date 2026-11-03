@@ -108,11 +108,16 @@ typedef struct display {
     lv_obj_t *network_label;
     lv_obj_t *status_label;
     lv_obj_t *notification_label;
+    lv_obj_t *notification_close_button;
     lv_obj_t *mute_label;
     lv_obj_t *battery_label;
     lv_obj_t *chat_message_label;
     lv_obj_t *low_battery_popup;
     lv_obj_t *low_battery_label;
+    lv_obj_t *shutdown_popup;
+    lv_obj_t *shutdown_countdown_label;
+    lv_obj_t *shutdown_close_button;
+    bool shutdown_countdown_dismissed;
     const char *battery_icon;
     int battery_percent;
     bool battery_valid;
@@ -1042,18 +1047,62 @@ static void esp_xiaozhi_chat_display_unlock(display_t *disp)
     }
 }
 
+static void esp_xiaozhi_chat_display_hide_notification_locked(display_t *disp)
+{
+    if (disp == NULL) {
+        return;
+    }
+    if (disp->notification_label != NULL) {
+        lv_obj_add_flag(disp->notification_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (disp->notification_close_button != NULL) {
+        lv_obj_add_flag(disp->notification_close_button, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (disp->status_label != NULL) {
+        lv_obj_clear_flag(disp->status_label, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void esp_xiaozhi_chat_display_notification_close_cb(lv_event_t *event)
+{
+    if (event == NULL) {
+        return;
+    }
+    display_t *disp = (display_t *)lv_event_get_user_data(event);
+    if (disp == NULL) {
+        return;
+    }
+    esp_xiaozhi_chat_display_hide_notification_locked(disp);
+    if (disp->notification_timer != NULL) {
+        esp_timer_stop(disp->notification_timer);
+    }
+}
+
+static void esp_xiaozhi_chat_display_shutdown_close_cb(lv_event_t *event)
+{
+    if (event == NULL) {
+        return;
+    }
+    display_t *disp = (display_t *)lv_event_get_user_data(event);
+    if (disp == NULL) {
+        return;
+    }
+    /* Closing the dialog only hides the UI. The battery monitor continues the
+     * 30-second protection countdown and will still shut down if charging does
+     * not recover. */
+    disp->shutdown_countdown_dismissed = true;
+    if (disp->shutdown_popup != NULL) {
+        lv_obj_add_flag(disp->shutdown_popup, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 static void esp_xiaozhi_chat_display_notification(void *arg)
 {
     display_t *disp = (display_t *)arg;
     if (disp == NULL || !esp_xiaozhi_chat_display_lock(disp, 30000)) {
         return;
     }
-    if (disp->notification_label != NULL) {
-        lv_obj_add_flag(disp->notification_label, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (disp->status_label != NULL) {
-        lv_obj_clear_flag(disp->status_label, LV_OBJ_FLAG_HIDDEN);
-    }
+    esp_xiaozhi_chat_display_hide_notification_locked(disp);
     esp_xiaozhi_chat_display_unlock(disp);
 }
 
@@ -1066,6 +1115,7 @@ static esp_err_t esp_xiaozhi_chat_display_state_init(display_t *disp)
     disp->battery_valid = false;
     disp->battery_charging = false;
     disp->low_battery_warning_visible = false;
+    disp->shutdown_countdown_dismissed = false;
     disp->network_icon = NULL;
     disp->muted = false;
     strlcpy(disp->current_theme_name, "light", sizeof(disp->current_theme_name));
@@ -1159,6 +1209,24 @@ static esp_err_t esp_xiaozhi_chat_display_setup_ui(lcd_display_t *lcd)
     lv_obj_set_style_text_color(disp->notification_label, lcd->current_theme.text, 0);
     lv_label_set_text(disp->notification_label, "");
     lv_obj_add_flag(disp->notification_label, LV_OBJ_FLAG_HIDDEN);
+    disp->notification_close_button = lv_btn_create(lcd->status_bar);
+    lv_obj_set_size(disp->notification_close_button, 22, 22);
+    lv_obj_set_style_radius(disp->notification_close_button, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(disp->notification_close_button,
+                              lv_color_hex(0xE5484D), 0);
+    lv_obj_set_style_bg_opa(disp->notification_close_button, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(disp->notification_close_button, 0, 0);
+    lv_obj_set_style_pad_all(disp->notification_close_button, 0, 0);
+    lv_obj_add_event_cb(disp->notification_close_button,
+                        esp_xiaozhi_chat_display_notification_close_cb,
+                        LV_EVENT_CLICKED, disp);
+    lv_obj_t *notification_close_icon =
+        lv_label_create(disp->notification_close_button);
+    lv_label_set_text(notification_close_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(notification_close_icon, lcd->fonts.icon_font, 0);
+    lv_obj_set_style_text_color(notification_close_icon, lv_color_white(), 0);
+    lv_obj_center(notification_close_icon);
+    lv_obj_add_flag(disp->notification_close_button, LV_OBJ_FLAG_HIDDEN);
     disp->status_label = lv_label_create(lcd->status_bar);
     lv_obj_set_flex_grow(disp->status_label, 1);
     lv_label_set_long_mode(disp->status_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
@@ -1187,6 +1255,50 @@ static esp_err_t esp_xiaozhi_chat_display_setup_ui(lcd_display_t *lcd)
     lv_obj_set_style_text_color(disp->low_battery_label, lv_color_white(), 0);
     lv_obj_center(disp->low_battery_label);
     lv_obj_add_flag(disp->low_battery_popup, LV_OBJ_FLAG_HIDDEN);
+
+    /* Global low-voltage shutdown dialog.  It is a direct child of the
+     * active screen, not the current page, so page changes cannot hide it. */
+    disp->shutdown_popup = lv_obj_create(screen);
+    lv_obj_set_scrollbar_mode(disp->shutdown_popup, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_size(disp->shutdown_popup, LV_HOR_RES * 0.9,
+                    lcd->fonts.text_font->line_height * 4);
+    lv_obj_align(disp->shutdown_popup, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(disp->shutdown_popup, lv_color_hex(0xB91C1C), 0);
+    lv_obj_set_style_bg_opa(disp->shutdown_popup, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(disp->shutdown_popup, 0, 0);
+    lv_obj_set_style_radius(disp->shutdown_popup, 16, 0);
+    lv_obj_set_style_pad_all(disp->shutdown_popup, 12, 0);
+    disp->shutdown_close_button = lv_btn_create(disp->shutdown_popup);
+    lv_obj_set_size(disp->shutdown_close_button, 24, 24);
+    lv_obj_align(disp->shutdown_close_button, LV_ALIGN_TOP_RIGHT, -2, -2);
+    lv_obj_set_style_radius(disp->shutdown_close_button, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(disp->shutdown_close_button,
+                              lv_color_hex(0x7F1D1D), 0);
+    lv_obj_set_style_bg_opa(disp->shutdown_close_button, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(disp->shutdown_close_button, 0, 0);
+    lv_obj_set_style_pad_all(disp->shutdown_close_button, 0, 0);
+    lv_obj_add_event_cb(disp->shutdown_close_button,
+                        esp_xiaozhi_chat_display_shutdown_close_cb,
+                        LV_EVENT_CLICKED, disp);
+    lv_obj_t *shutdown_close_icon =
+        lv_label_create(disp->shutdown_close_button);
+    lv_label_set_text(shutdown_close_icon, LV_SYMBOL_CLOSE);
+    lv_obj_set_style_text_font(shutdown_close_icon, lcd->fonts.icon_font, 0);
+    lv_obj_set_style_text_color(shutdown_close_icon, lv_color_white(), 0);
+    lv_obj_center(shutdown_close_icon);
+    disp->shutdown_countdown_label = lv_label_create(disp->shutdown_popup);
+    lv_obj_set_width(disp->shutdown_countdown_label, LV_HOR_RES * 0.8);
+    lv_label_set_long_mode(disp->shutdown_countdown_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_align(disp->shutdown_countdown_label,
+                                LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(disp->shutdown_countdown_label,
+                                lv_color_white(), 0);
+    lv_obj_set_style_text_font(disp->shutdown_countdown_label,
+                               lcd->fonts.text_font, 0);
+    lv_label_set_text(disp->shutdown_countdown_label,
+                      "电量过低\n30秒后关机，请及时连接充电器");
+    lv_obj_center(disp->shutdown_countdown_label);
+    lv_obj_add_flag(disp->shutdown_popup, LV_OBJ_FLAG_HIDDEN);
 
     /* Reusable container for PAGE-mode pages (dialogue / camera / ...). Hidden
      * until a page switches the panel away from the animated face. */
@@ -1232,6 +1344,20 @@ static esp_err_t esp_xiaozhi_chat_display_destroy(display_t *disp)
             lv_obj_del(lcd->container);
             lcd->container = NULL;
         }
+        if (disp->low_battery_popup != NULL) {
+            lv_obj_del(disp->low_battery_popup);
+            disp->low_battery_popup = NULL;
+        }
+        if (disp->shutdown_popup != NULL) {
+            lv_obj_del(disp->shutdown_popup);
+            disp->shutdown_popup = NULL;
+            disp->shutdown_countdown_label = NULL;
+            disp->shutdown_close_button = NULL;
+        }
+        if (s_page_root != NULL) {
+            lv_obj_del(s_page_root);
+            s_page_root = NULL;
+        }
         if (disp->lv_disp != NULL) {
             lv_display_delete(disp->lv_disp);
             disp->lv_disp = NULL;
@@ -1249,6 +1375,7 @@ static esp_err_t esp_xiaozhi_chat_display_destroy(display_t *disp)
         if (disp->network_label != NULL) {
             lv_obj_del(disp->network_label);
             lv_obj_del(disp->notification_label);
+            lv_obj_del(disp->notification_close_button);
             lv_obj_del(disp->status_label);
             lv_obj_del(disp->mute_label);
             lv_obj_del(disp->battery_label);
@@ -1258,6 +1385,12 @@ static esp_err_t esp_xiaozhi_chat_display_destroy(display_t *disp)
         if (disp->low_battery_popup != NULL) {
             lv_obj_del(disp->low_battery_popup);
             disp->low_battery_popup = NULL;
+        }
+        if (disp->shutdown_popup != NULL) {
+            lv_obj_del(disp->shutdown_popup);
+            disp->shutdown_popup = NULL;
+            disp->shutdown_countdown_label = NULL;
+            disp->shutdown_close_button = NULL;
         }
         if (disp->pm_lock != NULL) {
             esp_pm_lock_delete(disp->pm_lock);
@@ -1601,6 +1734,9 @@ esp_err_t esp_xiaozhi_chat_display_set_status(const char *status)
     if (s_display->notification_label != NULL) {
         lv_obj_add_flag(s_display->notification_label, LV_OBJ_FLAG_HIDDEN);
     }
+    if (s_display->notification_close_button != NULL) {
+        lv_obj_add_flag(s_display->notification_close_button, LV_OBJ_FLAG_HIDDEN);
+    }
     esp_xiaozhi_chat_display_unlock(s_display);
 
     /* Forward status to the active page (e.g. dialogue page shows it). The face
@@ -1625,6 +1761,9 @@ esp_err_t esp_xiaozhi_chat_display_clear_status(void)
     if (s_display->notification_label != NULL) {
         lv_label_set_text(s_display->notification_label, "");
         lv_obj_add_flag(s_display->notification_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_display->notification_close_button != NULL) {
+        lv_obj_add_flag(s_display->notification_close_button, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_display->status_label != NULL) {
         lv_label_set_text(s_display->status_label, "");
@@ -1657,6 +1796,9 @@ esp_err_t esp_xiaozhi_chat_display_set_subtitle(const char *subtitle)
     }
     if (s_display->notification_label != NULL) {
         lv_obj_add_flag(s_display->notification_label, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_display->notification_close_button != NULL) {
+        lv_obj_add_flag(s_display->notification_close_button, LV_OBJ_FLAG_HIDDEN);
     }
     esp_xiaozhi_chat_display_unlock(s_display);
 
@@ -1773,7 +1915,7 @@ esp_err_t esp_xiaozhi_chat_display_set_notification(const char *notification, in
     ESP_RETURN_ON_FALSE(notification, ESP_ERR_INVALID_ARG, TAG, "Invalid notification");
     ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG, "Display not initialized");
 
-    if (s_emote_active) {
+    if (s_emote_active && s_face_visible) {
         if (!emote_api_lock("notification")) {
             return ESP_ERR_TIMEOUT;
         }
@@ -1789,6 +1931,9 @@ esp_err_t esp_xiaozhi_chat_display_set_notification(const char *notification, in
         lv_label_set_text(s_display->notification_label, notification);
         lv_obj_clear_flag(s_display->notification_label, LV_OBJ_FLAG_HIDDEN);
     }
+    if (s_display->notification_close_button != NULL) {
+        lv_obj_clear_flag(s_display->notification_close_button, LV_OBJ_FLAG_HIDDEN);
+    }
     if (s_display->status_label != NULL) {
         lv_obj_add_flag(s_display->status_label, LV_OBJ_FLAG_HIDDEN);
     }
@@ -1797,6 +1942,79 @@ esp_err_t esp_xiaozhi_chat_display_set_notification(const char *notification, in
         esp_timer_stop(s_display->notification_timer);
         esp_timer_start_once(s_display->notification_timer, (uint64_t)duration_ms * 1000ULL);
     }
+    return ESP_OK;
+}
+
+esp_err_t esp_xiaozhi_chat_display_show_shutdown_countdown(int seconds)
+{
+    ESP_RETURN_ON_FALSE(seconds >= 0, ESP_ERR_INVALID_ARG, TAG,
+                        "Invalid shutdown countdown");
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG,
+                        "Display not initialized");
+
+    char message[96];
+    if (app_language_is_english()) {
+        snprintf(message, sizeof(message),
+                 "Battery voltage too low\nShutdown in %d seconds;\n"
+                 "connect the charger",
+                 seconds);
+    } else {
+        snprintf(message, sizeof(message),
+                 "电量过低\n%d秒后关机，请及时连接充电器", seconds);
+    }
+
+    if (s_emote_active && s_face_visible) {
+        if (!emote_api_lock("shutdown countdown")) {
+            return ESP_ERR_TIMEOUT;
+        }
+        esp_err_t ret = emote_set_event_msg(s_emote, EMOTE_MGR_EVT_SYS, message);
+        emote_api_unlock();
+        return ret;
+    }
+
+    if (!esp_xiaozhi_chat_display_lock(s_display, 30000)) {
+        return ESP_OK;
+    }
+    if (s_display->shutdown_popup != NULL) {
+        if (seconds >= 30) {
+            /* A fresh countdown may be shown again after the previous one was
+             * cancelled by charging or voltage recovery. */
+            s_display->shutdown_countdown_dismissed = false;
+        }
+        if (s_display->shutdown_countdown_label != NULL) {
+            lv_label_set_text(s_display->shutdown_countdown_label, message);
+        }
+        if (!s_display->shutdown_countdown_dismissed) {
+            lv_obj_clear_flag(s_display->shutdown_popup, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_t *parent = lv_obj_get_parent(s_display->shutdown_popup);
+            if (parent != NULL) {
+                lv_obj_move_to_index(s_display->shutdown_popup,
+                                     (int32_t)lv_obj_get_child_count(parent) - 1);
+            }
+        }
+    }
+    esp_xiaozhi_chat_display_unlock(s_display);
+    return ESP_OK;
+}
+
+esp_err_t esp_xiaozhi_chat_display_hide_shutdown_countdown(void)
+{
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG,
+                        "Display not initialized");
+
+    if (s_emote_active && s_face_visible) {
+        emote_set_status_event("Ready");
+        return ESP_OK;
+    }
+
+    if (!esp_xiaozhi_chat_display_lock(s_display, 30000)) {
+        return ESP_OK;
+    }
+    s_display->shutdown_countdown_dismissed = false;
+    if (s_display->shutdown_popup != NULL) {
+        lv_obj_add_flag(s_display->shutdown_popup, LV_OBJ_FLAG_HIDDEN);
+    }
+    esp_xiaozhi_chat_display_unlock(s_display);
     return ESP_OK;
 }
 

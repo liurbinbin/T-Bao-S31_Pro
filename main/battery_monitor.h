@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "driver/gpio.h"
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -16,6 +17,18 @@ extern "C" {
 #define BATTERY_MONITOR_XL9555_P03_CHARGE_INT  (1U << 3)
 #define BATTERY_MONITOR_XL9555_P04_CHARGE_PGOOD (1U << 4)
 #define BATTERY_MONITOR_SAMPLE_PERIOD_MS       1000
+
+/* Host input-current ceiling; ILIM, ICO, voltage and thermal limits stay active. */
+#define BATTERY_MONITOR_INPUT_CURRENT_LIMIT_MA 3300
+
+/* Battery protection thresholds.  The monitor uses the charger ADC voltage
+ * directly, so keep these values in millivolts. */
+#define BATTERY_MONITOR_LOW_VOLTAGE_MV         7000
+#define BATTERY_MONITOR_SHUTDOWN_VOLTAGE_MV    6500
+#define BATTERY_MONITOR_LOW_VOLTAGE_CLEAR_MV   7300
+#define BATTERY_MONITOR_LOW_VOLTAGE_SAMPLES    15
+#define BATTERY_MONITOR_SHUTDOWN_SAMPLES       15
+#define BATTERY_MONITOR_GPIO60_WAKE_PIN        GPIO_NUM_60
 
 typedef enum {
     BATTERY_MONITOR_PHASE_NOT_CHARGING = 0,
@@ -46,6 +59,8 @@ typedef struct {
      * charge current. This flag records that secondary evidence explicitly. */
     bool charging_current_detected;
     bool charge_done;
+    bool low_voltage_warning;
+    bool input_limit_pin_enabled;
     bool input_current_regulation;
     bool input_voltage_regulation;
     bool thermal_regulation;
@@ -56,6 +71,8 @@ typedef struct {
     uint8_t revision;
     uint8_t fault_bits;
     uint8_t ntc_state;
+    uint8_t input_source; /* VBUS_STAT[2:0] from REG0C[6:4]. */
+    uint8_t ico_status;
     battery_monitor_charge_phase_t phase;
 
     int battery_percent;
@@ -64,6 +81,8 @@ typedef struct {
     int vsys_mv;
     int ibus_ma;
     int ichg_ma;
+    int input_current_limit_ma; /* REG03 IINDPM; -1 when unavailable. */
+    int ico_current_limit_ma; /* REG0A limit in ICO mode; otherwise -1. */
     int die_temperature_deci_c;
     int ts_deci_percent;
 

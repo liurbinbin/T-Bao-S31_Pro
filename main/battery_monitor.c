@@ -1,10 +1,13 @@
 #include "battery_monitor.h"
 
 #include "battery_estimator.h"
+#include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
 #include "esp_io_expander.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
+#include "esp_xiaozhi_chat_display.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -21,11 +24,14 @@ enum {
     kExpectedPartId = 3,
     kAdcEnabledContinuous12Bit = 0xB0,
     kAdcSettleMs = 250,
+    kShutdownCountdownSeconds = 30,
     /* SGM41529 ICHG ADC is 1mA/LSB. Keep the fallback above idle noise while
      * still detecting the 50-80mA trickle/pre-charge ranges. */
     kChargingCurrentThresholdMa = 30,
     kRegIchg = 0x01,
+    kRegIindpm = 0x03,
     kRegChargerControl1 = 0x05,
+    kRegIcoCurrentLimit = 0x0A,
     kRegStatus1 = 0x0B,
     kRegStatus2 = 0x0C,
     kRegNtcStatus = 0x0D,
@@ -35,11 +41,19 @@ enum {
     kRegPartInformation = 0x25,
 };
 
-/* SGM41529 status/control bits. The monitor never writes the charge-control
- * registers; these masks only decode the state established by the board or
- * the charger itself. */
+/* Only REG03's input-current ceiling is maintained by the monitor. Battery
+ * voltage/current, charge gates, ILIM, ICO and other protections are preserved. */
 static const uint8_t kEnHizMask = 1U << 7;
+static const uint8_t kEnIlimMask = 1U << 6;
 static const uint8_t kEnChargeMask = 1U << 3;
+static const uint8_t kIindpmMask = 0x1FU;
+static const uint8_t kEnIcoMask = 1U << 5;
+static const uint8_t kForceInputDetectionMask = 1U << 6;
+
+_Static_assert(BATTERY_MONITOR_INPUT_CURRENT_LIMIT_MA >= 500 &&
+                   BATTERY_MONITOR_INPUT_CURRENT_LIMIT_MA <= 3300 &&
+                   (BATTERY_MONITOR_INPUT_CURRENT_LIMIT_MA - 500) % 100 == 0,
+               "Input current limit must be 500..3300mA in 100mA steps");
 
 static i2c_master_dev_handle_t s_charger;
 static esp_io_expander_handle_t s_expander;
@@ -50,8 +64,17 @@ static void *s_callback_context;
 static bool s_started;
 static bool s_adc_configured;
 static int s_filtered_percent = -1;
+static unsigned s_low_voltage_samples;
+static unsigned s_shutdown_voltage_samples;
+static bool s_low_voltage_notified;
+static bool s_shutdown_countdown_active;
+static TickType_t s_shutdown_countdown_deadline;
+static int s_shutdown_countdown_last_second = -1;
+static bool s_protection_sleep_started;
 static battery_monitor_state_t s_state = {
     .battery_percent = -1,
+    .input_current_limit_ma = -1,
+    .ico_current_limit_ma = -1,
     .phase = BATTERY_MONITOR_PHASE_UNKNOWN,
 };
 
@@ -88,6 +111,55 @@ static int decode_ibus(uint8_t high, uint8_t low)
 {
     const int magnitude = decode_adc_unsigned(high, low, 0x0F);
     return (high & 0x80U) != 0 ? -magnitude : magnitude;
+}
+
+static int decode_input_current_limit(uint8_t value)
+{
+    const unsigned code = value & kIindpmMask;
+    return 500 + (int)(code > 28U ? 28U : code) * 100;
+}
+
+static esp_err_t maintain_input_current_limit(battery_monitor_state_t *state)
+{
+    uint8_t input_control = 0;
+    ESP_RETURN_ON_ERROR(read_register(kRegIindpm, &input_control), TAG,
+                        "read input current limit");
+    state->input_current_limit_ma = decode_input_current_limit(input_control);
+
+    const uint8_t target_code =
+        (BATTERY_MONITOR_INPUT_CURRENT_LIMIT_MA - 500) / 100;
+    if ((input_control & kIindpmMask) != target_code &&
+        (input_control & kForceInputDetectionMask) == 0) {
+        const int previous_limit_ma = state->input_current_limit_ma;
+        /* D+/D- detection can overwrite IINDPM after USB insertion. Restore
+         * the ceiling each sampling cycle if needed, preserve EN_ICO, and
+         * never replay the one-shot FORCE_ICO/FORCE_INDET bits. */
+        const uint8_t updated_control =
+            (input_control & kEnIcoMask) | target_code;
+        ESP_RETURN_ON_ERROR(write_register(kRegIindpm, updated_control), TAG,
+                            "set input current limit");
+        ESP_RETURN_ON_ERROR(read_register(kRegIindpm, &input_control), TAG,
+                            "read back input current limit");
+        state->input_current_limit_ma = decode_input_current_limit(input_control);
+        ESP_RETURN_ON_FALSE((input_control & kIindpmMask) == target_code,
+                            ESP_ERR_INVALID_RESPONSE, TAG,
+                            "input current limit was overwritten; retry next sample");
+        ESP_LOGI(TAG,
+                 "USB input limit: %dmA -> %dmA; REG03=0x%02X "
+                 "VBUS_STAT=%u EN_ILIM=%d EN_ICO=%d",
+                 previous_limit_ma, state->input_current_limit_ma,
+                 input_control, (unsigned)state->input_source,
+                 state->input_limit_pin_enabled,
+                 (input_control & kEnIcoMask) != 0);
+    }
+
+    if (state->ico_status == 1 || state->ico_status == 2) {
+        uint8_t ico_limit = 0;
+        ESP_RETURN_ON_ERROR(read_register(kRegIcoCurrentLimit, &ico_limit), TAG,
+                            "read ICO input current limit");
+        state->ico_current_limit_ma = decode_input_current_limit(ico_limit);
+    }
+    return ESP_OK;
 }
 
 static battery_monitor_charge_phase_t decode_phase(uint8_t status1)
@@ -139,6 +211,9 @@ static void state_set_detail(battery_monitor_state_t *state)
     } else if (state->ntc_state == 5 || state->ntc_state == 6) {
         snprintf(state->detail, sizeof(state->detail),
                  "Battery temperature protection");
+    } else if (state->low_voltage_warning) {
+        snprintf(state->detail, sizeof(state->detail),
+                 "Battery voltage low; please charge");
     } else if (!state->input_present) {
         snprintf(state->detail, sizeof(state->detail),
                  "Battery powered; USB input disconnected");
@@ -236,6 +311,8 @@ static esp_err_t read_sample(battery_monitor_state_t *state)
 
     memset(state, 0, sizeof(*state));
     state->battery_percent = -1;
+    state->input_current_limit_ma = -1;
+    state->ico_current_limit_ma = -1;
     state->phase = decode_phase(status1);
     state->device_present = true;
     state->part_id = (part_information >> 3) & 0x0FU;
@@ -245,6 +322,9 @@ static esp_err_t read_sample(battery_monitor_state_t *state)
     state->power_good = (status2 & 0x80U) != 0;
     state->power_good_pin = (io_levels & BATTERY_MONITOR_XL9555_P04_CHARGE_PGOOD) == 0;
     state->input_present = state->power_good || state->power_good_pin;
+    state->input_source = (status2 >> 4) & 0x07U;
+    state->ico_status = (status2 >> 1) & 0x03U;
+    state->input_limit_pin_enabled = (ichg_control & kEnIlimMask) != 0;
     state->interrupt_active = (io_levels & BATTERY_MONITOR_XL9555_P03_CHARGE_INT) == 0;
     state->input_current_regulation = (status1 & 0x40U) != 0;
     state->input_voltage_regulation = (status1 & 0x20U) != 0;
@@ -317,8 +397,190 @@ static esp_err_t read_sample(battery_monitor_state_t *state)
         state->battery_percent = -1;
         s_filtered_percent = -1;
     }
+    if (state->valid && state->input_present && state->input_source != 7) {
+        const esp_err_t input_limit_ret = maintain_input_current_limit(state);
+        if (input_limit_ret != ESP_OK) {
+            /* A configuration failure must not discard valid voltage samples
+             * or interrupt low-voltage protection. Retry on the next sample. */
+            ESP_LOGW(TAG, "input current limit update failed: %s",
+                     esp_err_to_name(input_limit_ret));
+        }
+    }
     state_set_detail(state);
     return ESP_OK;
+}
+
+static void configure_low_voltage_wakeup(void)
+{
+    const gpio_config_t gpio60_config = {
+        .pin_bit_mask = 1ULL << BATTERY_MONITOR_GPIO60_WAKE_PIN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+
+    esp_err_t ret = gpio_config(&gpio60_config);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO60 input configuration failed: %s",
+                 esp_err_to_name(ret));
+        return;
+    }
+
+    /* GPIO wakeup is useful for light sleep and is harmless to configure
+     * here.  On ESP32-S31 GPIO60 is a digital-only pin, so it is not an
+     * EXT1/deep-sleep wake source on the current silicon. */
+    ret = gpio_wakeup_enable(BATTERY_MONITOR_GPIO60_WAKE_PIN,
+                             GPIO_INTR_LOW_LEVEL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO60 light-sleep wake configuration failed: %s",
+                 esp_err_to_name(ret));
+    } else {
+        ret = esp_sleep_enable_gpio_wakeup();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "GPIO wakeup enable failed: %s",
+                     esp_err_to_name(ret));
+        }
+    }
+
+    if (esp_sleep_is_valid_wakeup_gpio(BATTERY_MONITOR_GPIO60_WAKE_PIN)) {
+        ret = esp_sleep_enable_ext1_wakeup_io(
+            1ULL << BATTERY_MONITOR_GPIO60_WAKE_PIN,
+            ESP_EXT1_WAKEUP_ANY_LOW);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "GPIO60 deep-sleep wake enable failed: %s",
+                     esp_err_to_name(ret));
+        }
+    } else {
+        ESP_LOGW(TAG,
+                 "GPIO60 is not an RTC/EXT1 wake pin on this target; "
+                 "deep sleep will require an external reset or a future "
+                 "GPIO wake-capable silicon/IDF configuration");
+    }
+}
+
+static void enter_low_voltage_sleep(int vbat_mv)
+{
+    if (s_protection_sleep_started) {
+        return;
+    }
+    s_protection_sleep_started = true;
+
+    ESP_LOGE(TAG, "battery voltage %dmV below %dmV; entering deep sleep",
+             vbat_mv, BATTERY_MONITOR_SHUTDOWN_VOLTAGE_MV);
+    (void)esp_xiaozhi_chat_display_set_notification(
+        "电量过低，即将关机", 1500);
+    (void)esp_xiaozhi_chat_display_set_brightness(0);
+
+    /* Remove avoidable loads before the PMU cuts the running system down. */
+    (void)tbao_s31_board_set_speaker(false);
+    (void)tbao_s31_board_set_sd_power(false);
+    (void)tbao_s31_board_set_5v_power(false);
+    configure_low_voltage_wakeup();
+
+    vTaskDelay(pdMS_TO_TICKS(350));
+    esp_deep_sleep_start();
+}
+
+static void cancel_shutdown_countdown(void)
+{
+    if (!s_shutdown_countdown_active) {
+        return;
+    }
+    s_shutdown_countdown_active = false;
+    s_shutdown_countdown_deadline = 0;
+    s_shutdown_countdown_last_second = -1;
+    (void)esp_xiaozhi_chat_display_hide_shutdown_countdown();
+    ESP_LOGI(TAG, "battery voltage recovered/charging resumed; shutdown countdown cancelled");
+}
+
+static void update_shutdown_countdown(int vbat_mv)
+{
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t one_second_ticks = pdMS_TO_TICKS(1000);
+    const TickType_t countdown_ticks = pdMS_TO_TICKS(
+        kShutdownCountdownSeconds * 1000);
+
+    if (!s_shutdown_countdown_active) {
+        s_shutdown_countdown_active = true;
+        s_shutdown_countdown_deadline = now + countdown_ticks;
+        s_shutdown_countdown_last_second = kShutdownCountdownSeconds;
+        (void)esp_xiaozhi_chat_display_show_shutdown_countdown(
+            kShutdownCountdownSeconds);
+        ESP_LOGW(TAG,
+                 "battery voltage %dmV below %dmV; shutdown countdown started (%ds)",
+                 vbat_mv, BATTERY_MONITOR_SHUTDOWN_VOLTAGE_MV,
+                 kShutdownCountdownSeconds);
+        return;
+    }
+
+    if ((int32_t)(s_shutdown_countdown_deadline - now) <= 0) {
+        (void)esp_xiaozhi_chat_display_show_shutdown_countdown(0);
+        enter_low_voltage_sleep(vbat_mv);
+        return;
+    }
+
+    TickType_t remaining_ticks = s_shutdown_countdown_deadline - now;
+    TickType_t tick_unit = one_second_ticks > 0 ? one_second_ticks : 1;
+    int remaining_seconds = (int)((remaining_ticks + tick_unit - 1) / tick_unit);
+    if (remaining_seconds > kShutdownCountdownSeconds) {
+        remaining_seconds = kShutdownCountdownSeconds;
+    }
+    if (remaining_seconds != s_shutdown_countdown_last_second) {
+        s_shutdown_countdown_last_second = remaining_seconds;
+        (void)esp_xiaozhi_chat_display_show_shutdown_countdown(
+            remaining_seconds);
+        ESP_LOGW(TAG, "battery shutdown countdown: %d seconds remaining",
+                 remaining_seconds);
+    }
+}
+
+static void update_low_voltage_protection(battery_monitor_state_t *state)
+{
+    if (state == NULL || !state->valid || state->vbat_mv <= 0) {
+        s_low_voltage_samples = 0;
+        s_shutdown_voltage_samples = 0;
+        s_low_voltage_notified = false;
+        cancel_shutdown_countdown();
+        if (state != NULL) {
+            state->low_voltage_warning = false;
+        }
+        return;
+    }
+
+    if (state->vbat_mv < BATTERY_MONITOR_LOW_VOLTAGE_MV) {
+        if (s_low_voltage_samples < BATTERY_MONITOR_LOW_VOLTAGE_SAMPLES) {
+            ++s_low_voltage_samples;
+        }
+    } else if (state->vbat_mv >= BATTERY_MONITOR_LOW_VOLTAGE_CLEAR_MV) {
+        s_low_voltage_samples = 0;
+        s_low_voltage_notified = false;
+    }
+    state->low_voltage_warning =
+        s_low_voltage_samples >= BATTERY_MONITOR_LOW_VOLTAGE_SAMPLES;
+
+    if (state->low_voltage_warning && !s_low_voltage_notified) {
+        s_low_voltage_notified = true;
+        (void)esp_xiaozhi_chat_display_set_notification(
+            "电量低于7V，请及时充电", 3000);
+    }
+
+    const bool actively_charging =
+        state->input_present &&
+        (state->charging || state->charging_current_detected);
+    if (state->vbat_mv < BATTERY_MONITOR_SHUTDOWN_VOLTAGE_MV &&
+        !actively_charging) {
+        if (s_shutdown_voltage_samples < BATTERY_MONITOR_SHUTDOWN_SAMPLES) {
+            ++s_shutdown_voltage_samples;
+        }
+    } else {
+        s_shutdown_voltage_samples = 0;
+        cancel_shutdown_countdown();
+    }
+
+    if (s_shutdown_voltage_samples >= BATTERY_MONITOR_SHUTDOWN_SAMPLES) {
+        update_shutdown_countdown(state->vbat_mv);
+    }
 }
 
 static void publish_state(const battery_monitor_state_t *state)
@@ -345,6 +607,8 @@ static void publish_invalid_state(esp_err_t error, int failures)
 {
     battery_monitor_state_t state = {0};
     state.battery_percent = -1;
+    state.input_current_limit_ma = -1;
+    state.ico_current_limit_ma = -1;
     state.phase = BATTERY_MONITOR_PHASE_UNKNOWN;
     snprintf(state.detail, sizeof(state.detail),
              "SGM41529 read failed (%d/%d): %s",
@@ -376,13 +640,25 @@ static void battery_monitor_task(void *arg)
                      read_failures, kReadFailureLimit, esp_err_to_name(ret));
         } else {
             read_failures = 0;
+            update_low_voltage_protection(&state);
+            /* The voltage protection state is derived in the monitor task,
+             * after the charger sample has been decoded. */
+            state_set_detail(&state);
             publish_state(&state);
+            ESP_LOGI(TAG, "USB输入：%dmA 电池充电：%dmA",
+                     state.ibus_ma, state.ichg_ma);
             const bool state_changed = !have_last_sample ||
                 state.valid != last_sample.valid ||
                 state.input_present != last_sample.input_present ||
+                state.input_source != last_sample.input_source ||
+                state.input_current_limit_ma != last_sample.input_current_limit_ma ||
+                state.ico_status != last_sample.ico_status ||
+                state.ico_current_limit_ma != last_sample.ico_current_limit_ma ||
+                state.input_limit_pin_enabled != last_sample.input_limit_pin_enabled ||
                 state.phase != last_sample.phase ||
                 state.charging != last_sample.charging ||
                 state.charging_current_detected != last_sample.charging_current_detected ||
+                state.low_voltage_warning != last_sample.low_voltage_warning ||
                 state.charge_pin_enabled != last_sample.charge_pin_enabled ||
                 state.register_charge_enabled != last_sample.register_charge_enabled ||
                 state.high_impedance_mode != last_sample.high_impedance_mode ||
@@ -395,7 +671,9 @@ static void battery_monitor_task(void *arg)
                          "valid=%d USB=%d PG=%d/%d phase=%s charging=%d "
                          "VBUS=%dmV VBAT=%dmV ICHG=%dmA percent=%d "
                          "current_detected=%d nCE=%s EN_CHG=%d HIZ=%d "
-                         "ADC=%d WD=%d NTC=%u faults=0x%02X",
+                         "ADC=%d WD=%d NTC=%u faults=0x%02X "
+                         "VBUS_STAT=%u IINDPM=%dmA ICO_STAT=%u ICO_ILIM=%dmA "
+                         "EN_ILIM=%d IINDPM_STAT=%d VINDPM_STAT=%d TREG_STAT=%d",
                          state.valid, state.input_present,
                          state.power_good, state.power_good_pin,
                          battery_monitor_phase_name(state.phase), state.charging,
@@ -405,7 +683,11 @@ static void battery_monitor_task(void *arg)
                          state.charge_pin_enabled ? "LOW" : "HIGH",
                          state.register_charge_enabled, state.high_impedance_mode,
                          state.adc_enabled, state.watchdog_expired,
-                         state.ntc_state, state.fault_bits);
+                         state.ntc_state, state.fault_bits,
+                         (unsigned)state.input_source, state.input_current_limit_ma,
+                         (unsigned)state.ico_status, state.ico_current_limit_ma,
+                         state.input_limit_pin_enabled, state.input_current_regulation,
+                         state.input_voltage_regulation, state.thermal_regulation);
             }
             last_sample = state;
             have_last_sample = true;
@@ -486,8 +768,17 @@ esp_err_t battery_monitor_start(battery_monitor_callback_t callback,
     s_callback_context = context;
     s_adc_configured = false;
     s_filtered_percent = -1;
+    s_low_voltage_samples = 0;
+    s_shutdown_voltage_samples = 0;
+    s_low_voltage_notified = false;
+    s_shutdown_countdown_active = false;
+    s_shutdown_countdown_deadline = 0;
+    s_shutdown_countdown_last_second = -1;
+    s_protection_sleep_started = false;
     memset(&s_state, 0, sizeof(s_state));
     s_state.battery_percent = -1;
+    s_state.input_current_limit_ma = -1;
+    s_state.ico_current_limit_ma = -1;
     s_state.phase = BATTERY_MONITOR_PHASE_UNKNOWN;
     snprintf(s_state.detail, sizeof(s_state.detail),
              "Initializing SGM41529 at 0x%02X",

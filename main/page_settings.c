@@ -549,6 +549,9 @@ static const char *battery_connection_text(
     if (state == NULL || !state->device_present || !state->part_id_valid) {
         return app_language_text("暂不可用", "Unavailable");
     }
+    if (state->low_voltage_warning) {
+        return app_language_text("电量过低", "Battery low");
+    }
     if (state->charge_done) {
         return app_language_text("已充满", "Full");
     }
@@ -605,8 +608,9 @@ static void refresh_battery_detail_labels(
     const char *connection = battery_connection_text(state);
     if (s_battery_status != NULL) {
         lv_label_set_text(s_battery_status, connection);
-        const uint32_t color = state->charging ? SETTINGS_ORANGE
-            : (state->charge_done ? 0x34C759 : SETTINGS_BLUE);
+        const uint32_t color = state->low_voltage_warning ? SETTINGS_RED
+            : (state->charging ? SETTINGS_ORANGE
+               : (state->charge_done ? 0x34C759 : SETTINGS_BLUE));
         lv_obj_set_style_text_color(s_battery_status, lv_color_hex(color), 0);
     }
     if (s_battery_percent != NULL) {
