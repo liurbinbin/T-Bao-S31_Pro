@@ -130,9 +130,9 @@ esp_err_t esp_xiaozhi_chat_display_set_notification(const char *notification, in
 /**
  * @brief Show or update the global low-voltage shutdown countdown.
  *
- * The popup is attached to the active display screen, so it stays visible
- * while the user changes pages.  A value of zero displays the final shutdown
- * state.
+ * The popup is attached to the display's top layer, independently of pages.
+ * Repeated updates preserve user dismissal; hiding the popup does not cancel
+ * backend protection. A value of zero displays the final shutdown state.
  */
 esp_err_t esp_xiaozhi_chat_display_show_shutdown_countdown(int seconds);
 

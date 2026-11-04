@@ -1,6 +1,7 @@
 #include "battery_monitor.h"
 
 #include "battery_estimator.h"
+#include "app_language.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
@@ -9,6 +10,7 @@
 #include "esp_sleep.h"
 #include "esp_xiaozhi_chat_display.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "tbao_s31_board.h"
@@ -25,6 +27,7 @@ enum {
     kAdcEnabledContinuous12Bit = 0xB0,
     kAdcSettleMs = 250,
     kShutdownCountdownSeconds = 30,
+    kProtectionPollMs = 100,
     /* SGM41529 ICHG ADC is 1mA/LSB. Keep the fallback above idle noise while
      * still detecting the 50-80mA trickle/pre-charge ranges. */
     kChargingCurrentThresholdMa = 30,
@@ -54,11 +57,22 @@ _Static_assert(BATTERY_MONITOR_INPUT_CURRENT_LIMIT_MA >= 500 &&
                    BATTERY_MONITOR_INPUT_CURRENT_LIMIT_MA <= 3300 &&
                    (BATTERY_MONITOR_INPUT_CURRENT_LIMIT_MA - 500) % 100 == 0,
                "Input current limit must be 500..3300mA in 100mA steps");
+_Static_assert(BATTERY_MONITOR_CHARGING_CONFIRM_SAMPLES > 0,
+               "Charging confirmation requires at least one fresh sample");
 
 static i2c_master_dev_handle_t s_charger;
 static esp_io_expander_handle_t s_expander;
 static SemaphoreHandle_t s_state_mutex;
 static TaskHandle_t s_task;
+static TaskHandle_t s_protection_task;
+static TaskHandle_t s_display_task;
+static QueueHandle_t s_sample_queue;
+static QueueHandle_t s_display_queue;
+typedef struct {
+    battery_monitor_state_t state;
+    esp_err_t error;
+    TickType_t sampled_at;
+} battery_sample_t;
 static battery_monitor_callback_t s_callback;
 static void *s_callback_context;
 static bool s_started;
@@ -66,15 +80,22 @@ static bool s_adc_configured;
 static int s_filtered_percent = -1;
 static unsigned s_low_voltage_samples;
 static unsigned s_shutdown_voltage_samples;
-static bool s_low_voltage_notified;
+static bool s_low_voltage_warning;
+static unsigned s_charging_confirm_samples;
 static bool s_shutdown_countdown_active;
 static TickType_t s_shutdown_countdown_deadline;
 static int s_shutdown_countdown_last_second = -1;
+static int s_shutdown_trigger_voltage_mv;
 static bool s_protection_sleep_started;
+/* The UI only latches a request. The protection worker remains the sole owner
+ * of both automatic and manual shutdown, outside the LVGL event callback. */
+static portMUX_TYPE s_sleep_request_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_manual_sleep_requested;
 static battery_monitor_state_t s_state = {
     .battery_percent = -1,
     .input_current_limit_ma = -1,
     .ico_current_limit_ma = -1,
+    .shutdown_seconds_remaining = -1,
     .phase = BATTERY_MONITOR_PHASE_UNKNOWN,
 };
 
@@ -459,17 +480,22 @@ static void configure_low_voltage_wakeup(void)
     }
 }
 
-static void enter_low_voltage_sleep(int vbat_mv)
+static void enter_software_sleep(bool manual, int vbat_mv)
 {
     if (s_protection_sleep_started) {
         return;
     }
     s_protection_sleep_started = true;
 
-    ESP_LOGE(TAG, "battery voltage %dmV below %dmV; entering deep sleep",
-             vbat_mv, BATTERY_MONITOR_SHUTDOWN_VOLTAGE_MV);
-    (void)esp_xiaozhi_chat_display_set_notification(
-        "电量过低，即将关机", 1500);
+    if (manual) {
+        ESP_LOGI(TAG, "manual software shutdown requested; entering deep sleep");
+    } else {
+        ESP_LOGE(TAG,
+                 "latched low-voltage deadline reached; trigger=%dmV "
+                 "last_valid=%dmV; entering deep sleep",
+                 s_shutdown_trigger_voltage_mv, vbat_mv);
+    }
+    /* Neither shutdown source may wait for an LVGL/emote notification. */
     (void)esp_xiaozhi_chat_display_set_brightness(0);
 
     /* Remove avoidable loads before the PMU cuts the running system down. */
@@ -490,60 +516,47 @@ static void cancel_shutdown_countdown(void)
     s_shutdown_countdown_active = false;
     s_shutdown_countdown_deadline = 0;
     s_shutdown_countdown_last_second = -1;
-    (void)esp_xiaozhi_chat_display_hide_shutdown_countdown();
-    ESP_LOGI(TAG, "battery voltage recovered/charging resumed; shutdown countdown cancelled");
+    s_shutdown_voltage_samples = 0;
+    s_charging_confirm_samples = 0;
+    ESP_LOGI(TAG,
+             "shutdown countdown cancelled: charging_confirmed (%u fresh samples)",
+             (unsigned)BATTERY_MONITOR_CHARGING_CONFIRM_SAMPLES);
 }
 
-static void update_shutdown_countdown(int vbat_mv)
+/* Called by the protection task even when ADC/I2C or the UI is unavailable. */
+static bool update_shutdown_countdown(void)
 {
+    if (!s_shutdown_countdown_active) {
+        return false;
+    }
     const TickType_t now = xTaskGetTickCount();
     const TickType_t one_second_ticks = pdMS_TO_TICKS(1000);
-    const TickType_t countdown_ticks = pdMS_TO_TICKS(
-        kShutdownCountdownSeconds * 1000);
-
-    if (!s_shutdown_countdown_active) {
-        s_shutdown_countdown_active = true;
-        s_shutdown_countdown_deadline = now + countdown_ticks;
-        s_shutdown_countdown_last_second = kShutdownCountdownSeconds;
-        (void)esp_xiaozhi_chat_display_show_shutdown_countdown(
-            kShutdownCountdownSeconds);
-        ESP_LOGW(TAG,
-                 "battery voltage %dmV below %dmV; shutdown countdown started (%ds)",
-                 vbat_mv, BATTERY_MONITOR_SHUTDOWN_VOLTAGE_MV,
-                 kShutdownCountdownSeconds);
-        return;
-    }
-
-    if ((int32_t)(s_shutdown_countdown_deadline - now) <= 0) {
-        (void)esp_xiaozhi_chat_display_show_shutdown_countdown(0);
-        enter_low_voltage_sleep(vbat_mv);
-        return;
-    }
-
-    TickType_t remaining_ticks = s_shutdown_countdown_deadline - now;
-    TickType_t tick_unit = one_second_ticks > 0 ? one_second_ticks : 1;
-    int remaining_seconds = (int)((remaining_ticks + tick_unit - 1) / tick_unit);
-    if (remaining_seconds > kShutdownCountdownSeconds) {
-        remaining_seconds = kShutdownCountdownSeconds;
+    int remaining_seconds = 0;
+    if ((int32_t)(s_shutdown_countdown_deadline - now) > 0) {
+        const TickType_t remaining_ticks = s_shutdown_countdown_deadline - now;
+        const TickType_t tick_unit = one_second_ticks > 0 ? one_second_ticks : 1;
+        remaining_seconds = (int)((remaining_ticks + tick_unit - 1) / tick_unit);
+        if (remaining_seconds > kShutdownCountdownSeconds) {
+            remaining_seconds = kShutdownCountdownSeconds;
+        }
     }
     if (remaining_seconds != s_shutdown_countdown_last_second) {
         s_shutdown_countdown_last_second = remaining_seconds;
-        (void)esp_xiaozhi_chat_display_show_shutdown_countdown(
-            remaining_seconds);
         ESP_LOGW(TAG, "battery shutdown countdown: %d seconds remaining",
                  remaining_seconds);
     }
+    return remaining_seconds == 0;
 }
 
-static void update_low_voltage_protection(battery_monitor_state_t *state)
+/* Only fresh hardware samples enter this function, never cached UI values. */
+static void update_low_voltage_protection(const battery_monitor_state_t *state)
 {
-    if (state == NULL || !state->valid || state->vbat_mv <= 0) {
+    if (state == NULL || !state->valid || state->data_stale || state->vbat_mv <= 0) {
         s_low_voltage_samples = 0;
         s_shutdown_voltage_samples = 0;
-        s_low_voltage_notified = false;
-        cancel_shutdown_countdown();
-        if (state != NULL) {
-            state->low_voltage_warning = false;
+        s_charging_confirm_samples = 0;
+        if (s_shutdown_countdown_active) {
+            ESP_LOGW(TAG, "ADC/I2C sample unavailable; latched shutdown countdown retained");
         }
         return;
     }
@@ -554,20 +567,35 @@ static void update_low_voltage_protection(battery_monitor_state_t *state)
         }
     } else if (state->vbat_mv >= BATTERY_MONITOR_LOW_VOLTAGE_CLEAR_MV) {
         s_low_voltage_samples = 0;
-        s_low_voltage_notified = false;
+        s_low_voltage_warning = false;
     }
-    state->low_voltage_warning =
-        s_low_voltage_samples >= BATTERY_MONITOR_LOW_VOLTAGE_SAMPLES;
-
-    if (state->low_voltage_warning && !s_low_voltage_notified) {
-        s_low_voltage_notified = true;
-        (void)esp_xiaozhi_chat_display_set_notification(
-            "电量低于7V，请及时充电", 3000);
+    if (s_low_voltage_samples >= BATTERY_MONITOR_LOW_VOLTAGE_SAMPLES) {
+        s_low_voltage_warning = true;
     }
 
     const bool actively_charging =
-        state->input_present &&
+        state->input_present && state->charge_enabled &&
+        state->fault_bits == 0 && state->ntc_state != 5 && state->ntc_state != 6 &&
         (state->charging || state->charging_current_detected);
+
+    if (s_shutdown_countdown_active) {
+        if (actively_charging) {
+            if (s_charging_confirm_samples < BATTERY_MONITOR_CHARGING_CONFIRM_SAMPLES) {
+                ++s_charging_confirm_samples;
+            }
+            ESP_LOGI(TAG, "shutdown charging confirmation: %u/%u",
+                     s_charging_confirm_samples,
+                     (unsigned)BATTERY_MONITOR_CHARGING_CONFIRM_SAMPLES);
+            if (s_charging_confirm_samples >= BATTERY_MONITOR_CHARGING_CONFIRM_SAMPLES) {
+                cancel_shutdown_countdown();
+            }
+        } else {
+            s_charging_confirm_samples = 0;
+        }
+        /* Voltage rebound is not a cancellation condition after latching. */
+        return;
+    }
+
     if (state->vbat_mv < BATTERY_MONITOR_SHUTDOWN_VOLTAGE_MV &&
         !actively_charging) {
         if (s_shutdown_voltage_samples < BATTERY_MONITOR_SHUTDOWN_SAMPLES) {
@@ -575,18 +603,26 @@ static void update_low_voltage_protection(battery_monitor_state_t *state)
         }
     } else {
         s_shutdown_voltage_samples = 0;
-        cancel_shutdown_countdown();
     }
 
     if (s_shutdown_voltage_samples >= BATTERY_MONITOR_SHUTDOWN_SAMPLES) {
-        update_shutdown_countdown(state->vbat_mv);
+        s_shutdown_countdown_active = true;
+        s_shutdown_countdown_deadline = xTaskGetTickCount() +
+            pdMS_TO_TICKS(kShutdownCountdownSeconds * 1000);
+        s_shutdown_countdown_last_second = -1;
+        s_shutdown_trigger_voltage_mv = state->vbat_mv;
+        s_charging_confirm_samples = 0;
+        ESP_LOGW(TAG,
+                 "battery voltage %dmV below %dmV for %u samples; "
+                 "latched shutdown countdown started (%ds)",
+                 state->vbat_mv, BATTERY_MONITOR_SHUTDOWN_VOLTAGE_MV,
+                 (unsigned)BATTERY_MONITOR_SHUTDOWN_SAMPLES,
+                 kShutdownCountdownSeconds);
     }
 }
 
 static void publish_state(const battery_monitor_state_t *state)
 {
-    battery_monitor_callback_t callback;
-    void *context;
     if (s_state_mutex == NULL) {
         return;
     }
@@ -594,31 +630,199 @@ static void publish_state(const battery_monitor_state_t *state)
         return;
     }
     s_state = *state;
-    callback = s_callback;
-    context = s_callback_context;
     xSemaphoreGive(s_state_mutex);
 
-    if (callback != NULL) {
-        callback(state, context);
+    if (s_display_queue != NULL) {
+        /* A stalled renderer must never block sampling or protection. */
+        (void)xQueueOverwrite(s_display_queue, state);
     }
 }
 
-static void publish_invalid_state(esp_err_t error, int failures)
+static void make_display_state(const battery_sample_t *sample,
+                               const battery_monitor_state_t *last_valid,
+                               bool have_last_valid,
+                               TickType_t last_valid_at,
+                               battery_monitor_state_t *out)
+{
+    const TickType_t now = xTaskGetTickCount();
+    const TickType_t hold_ticks = pdMS_TO_TICKS(BATTERY_MONITOR_DISPLAY_HOLD_MS);
+    const bool fresh = sample->error == ESP_OK && sample->state.valid &&
+                       (now - sample->sampled_at) <= hold_ticks;
+    const TickType_t age = have_last_valid ? now - last_valid_at : 0;
+
+    *out = sample->state;
+    out->valid = fresh;
+    out->data_stale = false;
+    out->sample_age_ms = have_last_valid
+        ? (uint32_t)((uint64_t)age * 1000U / configTICK_RATE_HZ) : 0;
+    if (!fresh && have_last_valid && age <= hold_ticks) {
+        /* UI-only grace period: the protection task has already processed the
+         * actual failed/invalid sample, never this cached presentation state. */
+        *out = *last_valid;
+        out->valid = false;
+        out->data_stale = true;
+        out->sample_age_ms =
+            (uint32_t)((uint64_t)age * 1000U / configTICK_RATE_HZ);
+        snprintf(out->detail, sizeof(out->detail),
+                 "Data temporarily unavailable; last valid sample %ums ago",
+                 (unsigned)out->sample_age_ms);
+    } else if (!fresh && sample->state.valid) {
+        out->battery_percent = -1;
+        snprintf(out->detail, sizeof(out->detail),
+                 "Battery monitor sample timed out");
+    }
+
+    out->low_voltage_warning = s_low_voltage_warning || s_shutdown_countdown_active;
+    out->shutdown_countdown_active = s_shutdown_countdown_active;
+    out->shutdown_seconds_remaining = s_shutdown_countdown_active
+        ? s_shutdown_countdown_last_second : -1;
+    if (out->valid) {
+        state_set_detail(out);
+    }
+}
+
+static void battery_protection_task(void *arg)
+{
+    (void)arg;
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    battery_sample_t latest_sample = {0};
+    battery_monitor_state_t last_valid = {0};
+    battery_monitor_state_t last_published = {0};
+    bool have_sample = false;
+    bool have_last_valid = false;
+    bool have_published = false;
+    TickType_t last_valid_at = 0;
+
+    for (;;) {
+        portENTER_CRITICAL(&s_sleep_request_lock);
+        const bool manual_sleep_requested = s_manual_sleep_requested;
+        portEXIT_CRITICAL(&s_sleep_request_lock);
+        if (manual_sleep_requested) {
+            enter_software_sleep(true, have_last_valid ? last_valid.vbat_mv : 0);
+        }
+        battery_sample_t incoming;
+        const bool received = xQueueReceive(s_sample_queue, &incoming,
+            pdMS_TO_TICKS(kProtectionPollMs)) == pdTRUE;
+        if (received) {
+            if (have_sample &&
+                (incoming.sampled_at - latest_sample.sampled_at) >
+                    pdMS_TO_TICKS(BATTERY_MONITOR_DISPLAY_HOLD_MS)) {
+                /* Samples separated by a long gap are not consecutive. This
+                 * only resets confirmation counters, never a latched deadline. */
+                s_low_voltage_samples = 0;
+                s_shutdown_voltage_samples = 0;
+                s_charging_confirm_samples = 0;
+            }
+            latest_sample = incoming;
+            have_sample = true;
+            const bool fresh = incoming.error == ESP_OK && incoming.state.valid &&
+                (xTaskGetTickCount() - incoming.sampled_at) <=
+                    pdMS_TO_TICKS(BATTERY_MONITOR_DISPLAY_HOLD_MS);
+            update_low_voltage_protection(fresh ? &incoming.state : NULL);
+            if (fresh) {
+                last_valid = incoming.state;
+                last_valid_at = incoming.sampled_at;
+                have_last_valid = true;
+            }
+        } else if (have_sample &&
+                   (xTaskGetTickCount() - latest_sample.sampled_at) >
+                       pdMS_TO_TICKS(BATTERY_MONITOR_DISPLAY_HOLD_MS)) {
+            /* A stalled sampler breaks all pre-trigger/charging confirmation
+             * sequences, while the independent shutdown deadline keeps running. */
+            s_low_voltage_samples = 0;
+            s_shutdown_voltage_samples = 0;
+            s_charging_confirm_samples = 0;
+        }
+
+        const bool shutdown_due = update_shutdown_countdown();
+        if (have_sample) {
+            battery_monitor_state_t display_state;
+            make_display_state(&latest_sample, &last_valid, have_last_valid,
+                               last_valid_at, &display_state);
+            if (received || !have_published ||
+                display_state.valid != last_published.valid ||
+                display_state.data_stale != last_published.data_stale ||
+                display_state.shutdown_countdown_active !=
+                    last_published.shutdown_countdown_active ||
+                display_state.shutdown_seconds_remaining !=
+                    last_published.shutdown_seconds_remaining) {
+                publish_state(&display_state);
+                last_published = display_state;
+                have_published = true;
+            }
+        }
+        if (shutdown_due) {
+            /* No I2C sampling or LVGL calls stand between the deadline and
+             * the shutdown path. Missing ADC data is not voltage recovery. */
+            enter_software_sleep(false, have_last_valid ? last_valid.vbat_mv
+                                                       : s_shutdown_trigger_voltage_mv);
+        }
+    }
+}
+
+static void battery_display_task(void *arg)
+{
+    (void)arg;
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    bool countdown_was_active = false;
+    bool low_voltage_notified = false;
+
+    for (;;) {
+        battery_monitor_state_t state;
+        if (xQueueReceive(s_display_queue, &state, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (s_callback != NULL) {
+            s_callback(&state, s_callback_context);
+        }
+        /* The callback may have waited for the renderer. Discard its old
+         * countdown snapshot and render the newest backend state instead. */
+        if (battery_monitor_get_state(&state) != ESP_OK) {
+            continue;
+        }
+        if (state.shutdown_countdown_active) {
+            countdown_was_active = true;
+            (void)esp_xiaozhi_chat_display_show_shutdown_countdown(
+                state.shutdown_seconds_remaining);
+        } else if (countdown_was_active &&
+                   esp_xiaozhi_chat_display_hide_shutdown_countdown() == ESP_OK) {
+            countdown_was_active = false;
+        }
+
+        if (!state.low_voltage_warning) {
+            low_voltage_notified = false;
+        } else if (!low_voltage_notified && !state.shutdown_countdown_active) {
+            low_voltage_notified = esp_xiaozhi_chat_display_set_notification(
+                app_language_text("电量低于7V，请及时充电",
+                                  "Battery below 7V. Please charge."),
+                3000) == ESP_OK;
+        }
+    }
+}
+
+static void submit_invalid_sample(esp_err_t error, int failures)
 {
     battery_monitor_state_t state = {0};
     state.battery_percent = -1;
     state.input_current_limit_ma = -1;
     state.ico_current_limit_ma = -1;
+    state.shutdown_seconds_remaining = -1;
     state.phase = BATTERY_MONITOR_PHASE_UNKNOWN;
     snprintf(state.detail, sizeof(state.detail),
              "SGM41529 read failed (%d/%d): %s",
              failures, kReadFailureLimit, esp_err_to_name(error));
-    publish_state(&state);
+    const battery_sample_t sample = {
+        .state = state,
+        .error = error,
+        .sampled_at = xTaskGetTickCount(),
+    };
+    (void)xQueueOverwrite(s_sample_queue, &sample);
 }
 
 static void battery_monitor_task(void *arg)
 {
     (void)arg;
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     int read_failures = 0;
     battery_monitor_state_t last_sample = {0};
     bool have_last_sample = false;
@@ -633,18 +837,18 @@ static void battery_monitor_task(void *arg)
                 read_failures = kReadFailureLimit;
             }
             s_adc_configured = false;
-            s_filtered_percent = -1;
             have_last_sample = false;
-            publish_invalid_state(ret, read_failures);
+            submit_invalid_sample(ret, read_failures);
             ESP_LOGW(TAG, "battery sample failed (%d/%d): %s",
                      read_failures, kReadFailureLimit, esp_err_to_name(ret));
         } else {
             read_failures = 0;
-            update_low_voltage_protection(&state);
-            /* The voltage protection state is derived in the monitor task,
-             * after the charger sample has been decoded. */
-            state_set_detail(&state);
-            publish_state(&state);
+            const battery_sample_t sample = {
+                .state = state,
+                .error = ESP_OK,
+                .sampled_at = xTaskGetTickCount(),
+            };
+            (void)xQueueOverwrite(s_sample_queue, &sample);
             ESP_LOGI(TAG, "USB输入：%dmA 电池充电：%dmA",
                      state.ibus_ma, state.ichg_ma);
             const bool state_changed = !have_last_sample ||
@@ -713,6 +917,17 @@ esp_err_t battery_monitor_get_state(battery_monitor_state_t *out_state)
     return ESP_OK;
 }
 
+esp_err_t battery_monitor_request_sleep(void)
+{
+    if (!s_started || s_protection_task == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    portENTER_CRITICAL(&s_sleep_request_lock);
+    s_manual_sleep_requested = true;
+    portEXIT_CRITICAL(&s_sleep_request_lock);
+    return ESP_OK;
+}
+
 esp_err_t battery_monitor_start(battery_monitor_callback_t callback,
                                 void *context)
 {
@@ -770,35 +985,90 @@ esp_err_t battery_monitor_start(battery_monitor_callback_t callback,
     s_filtered_percent = -1;
     s_low_voltage_samples = 0;
     s_shutdown_voltage_samples = 0;
-    s_low_voltage_notified = false;
+    s_low_voltage_warning = false;
+    s_charging_confirm_samples = 0;
     s_shutdown_countdown_active = false;
     s_shutdown_countdown_deadline = 0;
     s_shutdown_countdown_last_second = -1;
+    s_shutdown_trigger_voltage_mv = 0;
     s_protection_sleep_started = false;
+    s_manual_sleep_requested = false;
     memset(&s_state, 0, sizeof(s_state));
     s_state.battery_percent = -1;
     s_state.input_current_limit_ma = -1;
     s_state.ico_current_limit_ma = -1;
+    s_state.shutdown_seconds_remaining = -1;
     s_state.phase = BATTERY_MONITOR_PHASE_UNKNOWN;
     snprintf(s_state.detail, sizeof(s_state.detail),
              "Initializing SGM41529 at 0x%02X",
              BATTERY_MONITOR_SGM41529_ADDRESS);
 
+    /* Single-slot mailboxes always keep the newest sample/state. Neither
+     * acquisition nor the deadline supervisor waits for the display worker. */
+    s_sample_queue = xQueueCreate(1, sizeof(battery_sample_t));
+    s_display_queue = xQueueCreate(1, sizeof(battery_monitor_state_t));
+    if (s_sample_queue == NULL || s_display_queue == NULL) {
+        goto start_failed;
+    }
+    publish_state(&s_state);
+    if (xTaskCreate(battery_display_task, "battery_ui", 4096, NULL, 4,
+                    &s_display_task) != pdPASS) {
+        goto start_failed;
+    }
+    if (xTaskCreate(battery_protection_task, "battery_protect", 4096, NULL, 6,
+                    &s_protection_task) != pdPASS) {
+        goto start_failed;
+    }
     if (xTaskCreate(battery_monitor_task, "battery_monitor", 4096, NULL, 5,
                     &s_task) != pdPASS) {
-        vSemaphoreDelete(s_state_mutex);
-        s_state_mutex = NULL;
-        (void)i2c_master_bus_rm_device(s_charger);
-        s_charger = NULL;
-        s_expander = NULL;
-        return ESP_ERR_NO_MEM;
+        goto start_failed;
     }
 
     s_started = true;
-    publish_state(&s_state);
+    /* Workers cannot run callbacks or touch shared resources until all three
+     * tasks were created successfully, making failure cleanup safe as well. */
+    xTaskNotifyGive(s_display_task);
+    xTaskNotifyGive(s_protection_task);
+    xTaskNotifyGive(s_task);
     ESP_LOGI(TAG, "monitor started: SGM41529=0x%02X XL9555=0x%02X sample=%dms",
              BATTERY_MONITOR_SGM41529_ADDRESS,
              BATTERY_MONITOR_XL9555_ADDRESS,
              BATTERY_MONITOR_SAMPLE_PERIOD_MS);
+    ESP_LOGI(TAG,
+             "latched shutdown: %dmV/%u samples, %ds deadline; "
+             "charging confirmation=%u samples; UI hold=%dms",
+             BATTERY_MONITOR_SHUTDOWN_VOLTAGE_MV,
+             (unsigned)BATTERY_MONITOR_SHUTDOWN_SAMPLES,
+             kShutdownCountdownSeconds,
+             (unsigned)BATTERY_MONITOR_CHARGING_CONFIRM_SAMPLES,
+             BATTERY_MONITOR_DISPLAY_HOLD_MS);
     return ESP_OK;
+
+start_failed:
+    if (s_task != NULL) {
+        vTaskDelete(s_task);
+        s_task = NULL;
+    }
+    if (s_protection_task != NULL) {
+        vTaskDelete(s_protection_task);
+        s_protection_task = NULL;
+    }
+    if (s_display_task != NULL) {
+        vTaskDelete(s_display_task);
+        s_display_task = NULL;
+    }
+    if (s_sample_queue != NULL) {
+        vQueueDelete(s_sample_queue);
+        s_sample_queue = NULL;
+    }
+    if (s_display_queue != NULL) {
+        vQueueDelete(s_display_queue);
+        s_display_queue = NULL;
+    }
+    vSemaphoreDelete(s_state_mutex);
+    s_state_mutex = NULL;
+    (void)i2c_master_bus_rm_device(s_charger);
+    s_charger = NULL;
+    s_expander = NULL;
+    return ESP_ERR_NO_MEM;
 }

@@ -28,6 +28,8 @@ extern "C" {
 #define BATTERY_MONITOR_LOW_VOLTAGE_CLEAR_MV   7300
 #define BATTERY_MONITOR_LOW_VOLTAGE_SAMPLES    15
 #define BATTERY_MONITOR_SHUTDOWN_SAMPLES       15
+#define BATTERY_MONITOR_CHARGING_CONFIRM_SAMPLES 3
+#define BATTERY_MONITOR_DISPLAY_HOLD_MS        3000
 #define BATTERY_MONITOR_GPIO60_WAKE_PIN        GPIO_NUM_60
 
 typedef enum {
@@ -42,7 +44,10 @@ typedef enum {
 } battery_monitor_charge_phase_t;
 
 typedef struct {
+    /* valid is reserved for fresh ADC data. Cached UI readings are explicitly
+     * marked data_stale and must never be used for protection decisions. */
     bool valid;
+    bool data_stale;
     bool device_present;
     bool part_id_valid;
     bool adc_enabled;
@@ -60,6 +65,7 @@ typedef struct {
     bool charging_current_detected;
     bool charge_done;
     bool low_voltage_warning;
+    bool shutdown_countdown_active;
     bool input_limit_pin_enabled;
     bool input_current_regulation;
     bool input_voltage_regulation;
@@ -83,6 +89,8 @@ typedef struct {
     int ichg_ma;
     int input_current_limit_ma; /* REG03 IINDPM; -1 when unavailable. */
     int ico_current_limit_ma; /* REG0A limit in ICO mode; otherwise -1. */
+    int shutdown_seconds_remaining; /* -1 when no shutdown is pending. */
+    uint32_t sample_age_ms;
     int die_temperature_deci_c;
     int ts_deci_percent;
 
@@ -99,6 +107,12 @@ esp_err_t battery_monitor_start(battery_monitor_callback_t callback,
 
 /** Return the most recently sampled state. */
 esp_err_t battery_monitor_get_state(battery_monitor_state_t *out_state);
+
+/** Request manual software shutdown (deep sleep) from the protection worker.
+ * Returns immediately; no low-voltage countdown or charging cancellation is
+ * applied. Wake sources follow the existing board configuration. The monitor
+ * must have started successfully; repeated requests are harmless. */
+esp_err_t battery_monitor_request_sleep(void);
 
 /** Return a stable human-readable name for a charge phase. */
 const char *battery_monitor_phase_name(battery_monitor_charge_phase_t phase);
