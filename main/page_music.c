@@ -19,6 +19,7 @@
 
 #include <string.h>
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "app_sfx.h"
 #include "app_music_player.h"
 #include "app_language.h"
@@ -699,7 +700,7 @@ static void music_search_task(void *arg)
         }
     }
     s_search_task = NULL;
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void start_online_search(const char *name)
@@ -713,8 +714,16 @@ static void start_online_search(const char *name)
         if (s_lyric) lv_label_set_text(s_lyric, app_language_text("正在搜索在线歌曲…", "Searching online…"));
         lvgl_port_unlock();
     }
-    if (xTaskCreatePinnedToCore(music_search_task, "music_srch", MUSIC_SEARCH_STACK,
-                                NULL, 4, &s_search_task, 1) != pdPASS) {
+    BaseType_t task_ret = xTaskCreatePinnedToCoreWithCaps(
+        music_search_task, "music_srch", MUSIC_SEARCH_STACK, NULL, 4,
+        &s_search_task, 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (task_ret != pdPASS) {
+        ESP_LOGW("MUSIC", "search PSRAM stack unavailable; retrying internal");
+        task_ret = xTaskCreatePinnedToCoreWithCaps(
+            music_search_task, "music_srch", MUSIC_SEARCH_STACK, NULL, 4,
+            &s_search_task, 1, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (task_ret != pdPASS) {
         s_search_task = NULL;
         if (lvgl_port_lock(1000)) {
             if (s_lyric) lv_label_set_text(s_lyric, app_language_text("搜索任务创建失败", "Could not start search"));

@@ -5965,7 +5965,6 @@ CONFIG_ESP_PAINTER_BASIC_FONT_12=y
 #
 # default:
 # CONFIG_ESP_H264_S31_USE_ASM is not set
-# default:
 CONFIG_ESP_H264_DECODER_IRAM=y
 # default:
 # CONFIG_ESP_H264_DUAL_TASK is not set

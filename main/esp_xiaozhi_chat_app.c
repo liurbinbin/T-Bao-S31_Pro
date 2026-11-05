@@ -3805,6 +3805,10 @@ esp_err_t esp_xiaozhi_chat_app(void)
             s_runtime_last_error = ESP_ERR_NO_MEM;
             ESP_LOGE(TAG, "Failed to create Xiaozhi runtime control task");
         }
+        /* Touch polling starts earlier so coordinates can be diagnosed during
+         * boot, but user input is enabled only after the splash/emote/page
+         * renderer handoff and runtime task setup are complete. */
+        ui_touch_set_enabled(true);
         return ESP_OK;
     } while (0);
 
