@@ -470,12 +470,17 @@ static void build_display_section(void)
 
 static bool wifi_is_connected(wifi_ap_record_t *record)
 {
+    if (!wifi_sta_is_connected()) {
+        return false;
+    }
     wifi_ap_record_t local_record = {0};
-    const bool connected = esp_wifi_sta_get_ap_info(&local_record) == ESP_OK;
-    if (connected && record != NULL) {
+    if (esp_wifi_sta_get_ap_info(&local_record) != ESP_OK) {
+        return false;
+    }
+    if (record != NULL) {
         *record = local_record;
     }
-    return connected;
+    return true;
 }
 
 static const char *xiaozhi_state_name(esp_xiaozhi_chat_app_state_t state)
@@ -763,6 +768,7 @@ static void language_option_cb(lv_event_t *event)
         set_notice("设置保存失败", SETTINGS_RED);
         return;
     }
+    esp_xiaozhi_chat_app_notify_language_changed();
     s_view = SETTINGS_VIEW_HOME;
     settings_render_view();
 }

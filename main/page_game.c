@@ -19,12 +19,16 @@
 #include "page_launcher.h"
 #include "ui_page_style.h"
 #include "launcher_icons.h"
+#include "game_pet_companion.h"
+#include "CompanionTheme.h"
 
 #define BG lv_color_black()
 #define FG lv_color_white()
 
+LV_FONT_DECLARE(font_puhui_16_4);
+
 /* --- sub-game state ------------------------------------------------------ */
-typedef enum { SUB_LAUNCHER, SUB_2048, SUB_MUYU } sub_t;
+typedef enum { SUB_LAUNCHER, SUB_2048, SUB_MUYU, SUB_COMPANION } sub_t;
 static sub_t s_sub = SUB_LAUNCHER;
 static void sub_show(sub_t s);
 static void sub_launcher_cb(lv_event_t *e);
@@ -56,6 +60,7 @@ static lv_obj_t *s_grid = NULL;
 
 /* --- launcher widgets --- */
 static lv_obj_t *s_launcher = NULL;
+static lv_obj_t *s_companion_card_status = NULL;
 
 /* ==================== helpers ==================== */
 
@@ -483,6 +488,16 @@ static void icon_muyu_cb(lv_event_t *e)
     sub_show(SUB_MUYU);
 }
 
+static void icon_companion_cb(lv_event_t *event)
+{
+    (void)event;
+    sub_show(SUB_COMPANION);
+}
+static void companion_back(void)
+{
+    sub_show(SUB_LAUNCHER);
+}
+
 static void build_launcher(lv_obj_t *parent)
 {
     s_launcher = lv_obj_create(parent);
@@ -493,7 +508,7 @@ static void build_launcher(lv_obj_t *parent)
     ui_page_make_header_image(s_launcher, &launcher_icon_game, "游戏", "选择玩法");
 
     lv_obj_t *row = lv_obj_create(s_launcher);
-    lv_obj_set_size(row, LV_HOR_RES - 20, 90);
+    lv_obj_set_size(row, LV_HOR_RES - 20, 180);
     lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 58);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -504,6 +519,22 @@ static void build_launcher(lv_obj_t *parent)
     lv_obj_set_style_pad_row(row, 8, 0);
     make_icon_btn(row, "🔢", "2048", icon_2048_cb, 0x5C8DFF);      /* blue  */
     make_icon_btn(row, "🪵", app_language_text("敲木鱼", "Wooden fish"), icon_muyu_cb, 0xF5B041);    /* amber */
+    lv_obj_t *companion = make_icon_btn(row, "o_o", app_language_text("芽伴同行", "Pet Ring"), icon_companion_cb, PET_THEME_PAPER);
+    lv_obj_set_size(companion, 284, 96);
+    ui_page_style_button(companion,PET_THEME_PAPER,PET_THEME_MINT,16);
+    lv_obj_set_style_border_color(companion,lv_color_hex(PET_THEME_LINE),0);
+    lv_obj_set_style_text_color(lv_obj_get_child(companion,0),lv_color_hex(PET_THEME_LEAF),0);
+    lv_obj_set_style_text_color(lv_obj_get_child(companion,1),lv_color_hex(PET_THEME_INK),0);
+    lv_obj_set_style_translate_y(lv_obj_get_child(companion, 1), -22, 0);
+    s_companion_card_status = lv_label_create(companion);
+    lv_obj_set_style_text_color(s_companion_card_status,lv_color_hex(PET_THEME_MUTED),0);
+    lv_obj_align(s_companion_card_status, LV_ALIGN_LEFT_MID, 52, 4);
+    lv_label_set_text(s_companion_card_status, app_language_text("点击连接指环", "Connect your ring"));
+    lv_obj_t *companion_hint = lv_label_create(companion);
+    lv_obj_set_style_text_font(companion_hint, &font_puhui_16_4, 0);
+    lv_obj_set_style_text_color(companion_hint,lv_color_hex(PET_THEME_MUTED),0);
+    lv_obj_align(companion_hint, LV_ALIGN_LEFT_MID, 52, 27);
+    lv_label_set_text(companion_hint, app_language_text("请连接T-QT-C6以开始游戏", "Connect T-QT-C6 to start"));
 
     lv_obj_t *hint = lv_label_create(s_launcher);
     lv_label_set_text(hint, app_language_text("选择一个游戏", "Choose a game"));
@@ -522,6 +553,8 @@ static void sub_launcher_cb(lv_event_t *e)
 
 static void sub_show(sub_t s)
 {
+    if (s_sub == SUB_COMPANION) game_pet_companion_exit();
+    s_companion_card_status = NULL;
     s_sub = s;
     lv_obj_t *root = esp_xiaozhi_chat_display_page_root();
     if (root == NULL) {
@@ -529,10 +562,13 @@ static void sub_show(sub_t s)
     }
     lv_obj_clean(root);
     lv_obj_set_style_bg_color(root, BG, 0);
+    lv_obj_set_style_text_color(root, FG, 0); // 恢复深色父页，避免同行浅色主题污染其他游戏。
     if (s == SUB_LAUNCHER) {
         build_launcher(root);
     } else if (s == SUB_2048) {
         build_2048(root);
+    } else if (s == SUB_COMPANION) {
+        game_pet_companion_build(root, companion_back);
     } else {
         build_muyu(root);
     }
@@ -553,6 +589,7 @@ esp_err_t page_game_on_enter(void)
 
 esp_err_t page_game_on_exit(void)
 {
+    if (s_sub == SUB_COMPANION) game_pet_companion_exit();
     /* The page manager clears the page root on the next switch; any static
      * pointers into the widgets we built become dangling. Reset the sub-game
      * state and all cached widget pointers so a later tick / gesture can
@@ -560,6 +597,7 @@ esp_err_t page_game_on_exit(void)
      * crashes while switching pages). */
     s_sub = SUB_LAUNCHER;
     s_launcher = NULL;
+    s_companion_card_status = NULL;
     s_grid = NULL;
     s_score_label = NULL;
     s_msg_label = NULL;
@@ -580,6 +618,10 @@ esp_err_t page_game_on_exit(void)
 
 bool page_game_on_gesture(ui_gesture_t g)
 {
+    if (s_sub == SUB_COMPANION) {
+        if (g == UI_GESTURE_SWIPE_RIGHT) companion_back();
+        return g != UI_GESTURE_TAP;
+    }
     if (s_sub == SUB_2048 && s_grid == NULL) {
         return false;
     }
@@ -621,6 +663,16 @@ bool page_game_on_gesture(ui_gesture_t g)
 
 void page_game_on_tick(uint32_t ms)
 {
+    if (s_sub == SUB_COMPANION) game_pet_companion_tick(ms);
+    if (s_sub == SUB_LAUNCHER && s_companion_card_status != NULL) {
+        app_petlink_state_t state;
+        app_petlink_get_state(&state);
+        lv_label_set_text(s_companion_card_status, state.error != ESP_OK ?
+            app_language_text("联动暂不可用", "Link unavailable") : state.connected ?
+            app_language_text("伙伴已连接", "Companion connected") : state.bound ?
+            app_language_text("等待伙伴连接", "Waiting for ring") :
+            app_language_text("点击连接指环", "Connect your ring"));
+    }
     /* Wooden-fish GIF animation. */
     if (s_sub == SUB_MUYU && s_muyu_img != NULL) {
         static uint32_t s_muyu_last = 0;

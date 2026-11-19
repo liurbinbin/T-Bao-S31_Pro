@@ -1,4 +1,5 @@
 #include "page_motion.h"
+#include "page_motion_calibration.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -115,11 +116,21 @@ static void refresh_motion_state(void)
                           app_language_text("执行器故障，已锁定；重启后检查接线",
                                             "Actuator fault locked; check wiring after restart"));
     }
+    if (!s_manual_active && !s_servo_active) {
+        s_servo_pulse_us = state.current_servo_pulse_us;
+        if (s_servo_slider != NULL) {
+            lv_slider_set_value(s_servo_slider, s_servo_pulse_us, LV_ANIM_OFF);
+        }
+    }
     if (s_servo_label != NULL) {
+        motion_calibration_t calibration;
+        motion_manager_get_calibration(&calibration);
+        const int physical_us = motion_calibration_servo_to_physical(
+            &calibration, s_servo_pulse_us);
         lv_label_set_text_fmt(
             s_servo_label,
             app_language_is_english() ? "Servo %d us" : "舵机 %d us",
-            s_servo_pulse_us);
+            physical_us);
     }
 }
 
@@ -184,12 +195,7 @@ static void motion_servo_slider_cb(lv_event_t *event)
         s_manual_active ? s_manual_direction.linear : 0.0f,
         s_manual_active ? s_manual_direction.angular : 0.0f,
         s_servo_pulse_us, true);
-    if (s_servo_label != NULL) {
-        lv_label_set_text_fmt(
-            s_servo_label,
-            app_language_is_english() ? "Servo %d us" : "舵机 %d us",
-            s_servo_pulse_us);
-    }
+    refresh_motion_state();
 }
 
 static void motion_stop_cb(lv_event_t *event)
@@ -213,7 +219,7 @@ static void motion_spin_cb(lv_event_t *event)
     s_servo_active = false;
     motion_behavior_release_manual();
     motion_manager_stop_all();
-    if (motion_behavior_start_named(MOTION_BEHAVIOR_ACTION_SPIN_360) != ESP_OK) {
+    if (motion_behavior_start_manual_named(MOTION_BEHAVIOR_ACTION_SPIN_360) != ESP_OK) {
         if (s_notice_label != NULL) {
             lv_label_set_text(s_notice_label, app_language_text("运动不可用或动作被拒绝", "Motion unavailable or action rejected"));
         }
@@ -239,6 +245,37 @@ static void motion_reset_pose_cb(lv_event_t *event)
     refresh_motion_state();
 }
 
+static void calibration_closed(bool saved)
+{
+    refresh_motion_state();
+    if (s_notice_label != NULL) {
+        lv_label_set_text(s_notice_label, saved ?
+            app_language_text("运动校准已保存，重启后仍有效", "Calibration saved and kept after restart") :
+            app_language_text("已取消校准，保持原设置", "Calibration cancelled; original settings restored"));
+    }
+}
+
+static void motion_calibration_cb(lv_event_t *event)
+{
+    (void)event;
+    s_manual_active = false;
+    s_servo_active = false;
+    motion_behavior_release_manual();
+    const esp_err_t ret = page_motion_calibration_open(
+        esp_xiaozhi_chat_display_page_root(), calibration_closed);
+    if (ret != ESP_OK && s_notice_label != NULL) {
+        lv_label_set_text(s_notice_label, app_language_text(
+            "校准暂不可用，请先检查运动状态", "Calibration unavailable; check motion status"));
+    }
+}
+
+static bool motion_on_gesture(ui_gesture_t gesture)
+{
+    (void)gesture;
+    /* 校准退出由弹窗逐项确认，避免滑动或手势导航时误离开。 */
+    return page_motion_calibration_is_open();
+}
+
 esp_err_t page_motion_on_enter(void)
 {
     lv_obj_t *root = esp_xiaozhi_chat_display_page_root();
@@ -261,6 +298,9 @@ esp_err_t page_motion_on_enter(void)
     ui_page_style_root(root);
     ui_page_make_back_button(root);
     ui_page_make_header_image(root, &launcher_icon_motion, "移动", "手动驾驶");
+    create_button(root, app_language_text("校准", "Calib."),
+                  LV_HOR_RES - 76, 10, 64, 32, 0x31536C,
+                  motion_calibration_cb, NULL, LV_EVENT_CLICKED);
 
     s_status_label = lv_label_create(root);
     set_label_style(s_status_label, &font_puhui_16_4,
@@ -337,6 +377,7 @@ esp_err_t page_motion_on_enter(void)
 
 esp_err_t page_motion_on_exit(void)
 {
+    page_motion_calibration_close();
     s_manual_active = false;
     s_servo_active = false;
     motion_behavior_release_manual();
@@ -352,6 +393,10 @@ esp_err_t page_motion_on_exit(void)
 
 void page_motion_on_tick(uint32_t ms)
 {
+    if (page_motion_calibration_is_open()) {
+        page_motion_calibration_tick(ms);
+        return;
+    }
     if (s_manual_active && ms - s_last_manual_ms >= MOTION_MANUAL_REFRESH_MS) {
         s_last_manual_ms = ms;
         motion_behavior_submit_manual_control(
@@ -373,5 +418,6 @@ const ui_page_t page_motion = {
     .name = "motion",
     .on_enter = page_motion_on_enter,
     .on_exit = page_motion_on_exit,
+    .on_gesture = motion_on_gesture,
     .on_tick = page_motion_on_tick,
 };

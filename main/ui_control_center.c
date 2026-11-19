@@ -26,6 +26,7 @@
 #include "font_awesome_symbols.h"
 #include "app_sfx.h"
 #include "app_language.h"
+#include "app_petlink.h"
 #include "lvgl.h"
 
 static const char *TAG = "CTRL_CENTER";
@@ -141,8 +142,7 @@ static lv_obj_t *make_text_label(lv_obj_t *parent, const char *text,
 
 static bool wifi_is_connected(void)
 {
-    wifi_ap_record_t record = {0};
-    return esp_wifi_sta_get_ap_info(&record) == ESP_OK;
+    return wifi_sta_is_connected();
 }
 
 static void set_status_text(const char *text, bool attention)
@@ -808,6 +808,7 @@ void ui_control_center_open(void)
     if (!s_inited || s_open || s_pending_open) {
         return;
     }
+    if (ui_page_manager_current() == PAGE_GAME) app_petlink_stop();
     s_pending_open = true;
     s_saved_face = (ui_page_manager_current() == PAGE_FACE);
     /* The emote face and LVGL cannot flush the same panel simultaneously. */

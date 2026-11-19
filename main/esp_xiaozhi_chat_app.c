@@ -18,7 +18,9 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_event.h"
+#include "esp_wifi.h"
 #include "esp_heap_caps.h"
+#include "esp_attr.h"
 #include "esp_timer.h"
 
 #include "audio_processor.h"
@@ -48,6 +50,8 @@
 #include "motion_web_server.h"
 #include "app_settings.h"
 #include "app_language.h"
+#include "app_pairing_code.h"
+#include "app_memory.h"
 
 #include "app_chat_history.h"
 #include "app_sfx.h"
@@ -168,7 +172,7 @@ static int current_red = 0;          // 0..255
 static int current_green = 0;        // 0..255
 static int current_blue = 0;         // 0..255
 static app_settings_t s_settings = {
-    .xiaozhi_enabled = true,
+    .xiaozhi_enabled = false,
     .volume = 80,
     .brightness = 80,
 };
@@ -368,6 +372,10 @@ static volatile bool s_runtime_requested = true;
 static volatile esp_xiaozhi_chat_app_state_t s_runtime_state =
     ESP_XIAOZHI_CHAT_APP_STATE_DISABLED;
 static volatile esp_err_t s_runtime_last_error = ESP_OK;
+/* 记录本次会话采用的语言，供后台合并连续的语言切换请求。 */
+static app_language_t s_runtime_language = APP_LANGUAGE_ZH_CN;
+/* 累积同一段 TTS 的字幕，以兼容提示语和六位数字分句到达。 */
+static EXT_RAM_BSS_ATTR char s_pairing_announcement[256];
 
 /* The MCP tool callback runs in the small (4 KB) websocket_task stack. The
  * camera capture + TLS-explain path overflows that stack (Guru Meditation /
@@ -908,7 +916,9 @@ static esp_mcp_value_t camera_take_photo_do(const esp_mcp_property_list_t *prope
         .len = jlen,
     };
 
-    char *response = heap_caps_calloc(1, 4096, MALLOC_CAP_8BIT);
+    /* 识别响应只是文本，不能在拍照/TLS 峰值时再占用内部 SRAM。 */
+    char *response = heap_caps_calloc(
+        1, 4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (response == NULL) {
         app_camera_release_jpeg(jpeg);
         ESP_LOGE(TAG, "Failed to allocate explain response buffer");
@@ -1423,6 +1433,39 @@ static void esp_xiaozhi_chat_app_audio_error(esp_err_t error)
     esp_xiaozhi_chat_display_set_emotion("sad");
 }
 
+static void xiaozhi_pairing_code_from_text(const char *text)
+{
+    if (text == NULL) {
+        return;
+    }
+    char code[APP_PAIRING_CODE_DIGITS + 1];
+    bool found = app_pairing_code_extract(text, code);
+    if (!found) {
+        size_t len = strlen(text);
+        const size_t capacity = sizeof(s_pairing_announcement) - 1;
+        if (len > capacity) {
+            text += len - capacity;
+            len = capacity;
+        }
+        size_t used = strlen(s_pairing_announcement);
+        if (used + len > capacity) {
+            size_t discard = used + len - capacity;
+            memmove(s_pairing_announcement, s_pairing_announcement + discard,
+                    used - discard);
+            used -= discard;
+        }
+        memcpy(s_pairing_announcement + used, text, len);
+        s_pairing_announcement[used + len] = '\0';
+        found = app_pairing_code_extract(s_pairing_announcement, code);
+    }
+    if (found) {
+        esp_err_t ret = esp_xiaozhi_chat_display_show_activation_code(code);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to queue pairing code popup: %s", esp_err_to_name(ret));
+        }
+    }
+}
+
 static void esp_xiaozhi_chat_app_audio_event(esp_xiaozhi_chat_event_t event, void *event_data, void *ctx)
 {
     esp_xiaozhi_chat_app_t *xiaozhi_chat_app =
@@ -1448,6 +1491,7 @@ static void esp_xiaozhi_chat_app_audio_event(esp_xiaozhi_chat_event_t event, voi
         esp_xiaozhi_chat_tts_state_t *tts = (esp_xiaozhi_chat_tts_state_t *)event_data;
         if (tts) {
             if (tts->state == ESP_XIAOZHI_CHAT_TTS_STATE_START) {
+                s_pairing_announcement[0] = '\0';
                 /* A new server answer opens a fresh playback generation. Stop
                  * feeding the recorder pipeline while the speaker is active:
                  * keeping it running made the AFE(FEED) ringbuffer fill and
@@ -1471,6 +1515,9 @@ static void esp_xiaozhi_chat_app_audio_event(esp_xiaozhi_chat_event_t event, voi
         }
         break;
     }
+    case ESP_XIAOZHI_CHAT_EVENT_CHAT_ALERT:
+        xiaozhi_pairing_code_from_text((const char *)event_data);
+        break;
     case ESP_XIAOZHI_CHAT_EVENT_CHAT_SYSTEM_CMD:
         if (event_data && strcmp((const char *)event_data, "reboot") == 0) {
             ESP_LOGI(TAG, "System command reboot, restarting");
@@ -1483,6 +1530,9 @@ static void esp_xiaozhi_chat_app_audio_event(esp_xiaozhi_chat_event_t event, voi
             const char *role_str = (text_data->role == ESP_XIAOZHI_CHAT_TEXT_ROLE_USER) ? "user" : "assistant";
             chat_role_t role = (text_data->role == ESP_XIAOZHI_CHAT_TEXT_ROLE_USER)
                                  ? CHAT_ROLE_USER : CHAT_ROLE_ASSISTANT;
+            if (role == CHAT_ROLE_ASSISTANT) {
+                xiaozhi_pairing_code_from_text(text_data->text);
+            }
             /* Persist locally and forward to the active page (the face page
              * shows it as an emote toast; the dialogue page appends a bubble). */
             app_chat_history_append(role, text_data->text);
@@ -1616,6 +1666,9 @@ static void esp_xiaozhi_chat_app_event(void *arg, esp_event_base_t event_base, i
     }
 }
 
+#define XIAOZHI_MCP_MOTION_INSTRUCTIONS \
+    "This device is a differential-drive desktop robot. Use self.motion.drive for forward, reverse, and steering, self.motion.spin for an in-place turn with a caller-selected duration, and self.motion.spin_360 for exactly one full calibrated revolution. For a one-circle request, you MUST call self.motion.spin_360 and must not simulate it with self.motion.drive or invent a duration. Use self.motion.stop to stop, self.motion.get_status to inspect state, and self.servo.set_angle, self.servo.nod, or self.servo.center for head control."
+
 static esp_err_t esp_xiaozhi_chat_app_init(esp_xiaozhi_chat_app_t *xiaozhi_chat_app)
 {
     ESP_RETURN_ON_FALSE(xiaozhi_chat_app != NULL, ESP_ERR_INVALID_ARG, TAG, "Invalid app");
@@ -1634,6 +1687,22 @@ static esp_err_t esp_xiaozhi_chat_app_init(esp_xiaozhi_chat_app_t *xiaozhi_chat_
             break;
         }
 
+        s_pairing_announcement[0] = '\0';
+        if (info.has_activation_code && info.activation_code != NULL) {
+            /* 弹窗接口复制字符串，info 在初始化结束后即可安全释放。 */
+            esp_err_t popup_ret = esp_xiaozhi_chat_display_show_activation_code(
+                info.activation_code);
+            if (popup_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to show OTA pairing code: %s",
+                         esp_err_to_name(popup_ret));
+            }
+        } else {
+            (void)esp_xiaozhi_chat_display_hide_activation_code();
+            if (info.activation_message != NULL) {
+                xiaozhi_pairing_code_from_text(info.activation_message);
+            }
+        }
+
         ret = esp_mcp_create(&mcp);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to create MCP engine: %s", esp_err_to_name(ret));
@@ -1642,7 +1711,11 @@ static esp_err_t esp_xiaozhi_chat_app_init(esp_xiaozhi_chat_app_t *xiaozhi_chat_
 
         ret = esp_mcp_set_instructions(
             mcp,
-            "This device is a differential-drive desktop robot. Use self.motion.drive for forward, reverse, and steering, self.motion.spin for an in-place turn with a caller-selected duration, and self.motion.spin_360 for exactly one full calibrated revolution. For a one-circle request, you MUST call self.motion.spin_360 and must not simulate it with self.motion.drive or invent a duration. Use self.motion.stop to stop, self.motion.get_status to inspect state, and self.servo.set_angle, self.servo.nod, or self.servo.center for head control.");
+            app_language_text(
+                "The device conversation language is now Simplified Chinese (zh-CN). This replaces earlier language preferences. Respond in Simplified Chinese unless the user makes a new request for another language. "
+                XIAOZHI_MCP_MOTION_INSTRUCTIONS,
+                "The device conversation language is now English (en-US). This replaces earlier language preferences. Respond in English unless the user makes a new request for another language. "
+                XIAOZHI_MCP_MOTION_INSTRUCTIONS));
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to set motion MCP instructions: %s",
                      esp_err_to_name(ret));
@@ -1740,6 +1813,7 @@ static esp_err_t esp_xiaozhi_chat_app_init(esp_xiaozhi_chat_app_t *xiaozhi_chat_
         }
         mcp = NULL;
 
+        motion_behavior_set_xiaozhi_enabled(true);
         ret = esp_xiaozhi_chat_start(xiaozhi_chat_app->chat);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to start chat: %s", esp_err_to_name(ret));
@@ -1747,6 +1821,9 @@ static esp_err_t esp_xiaozhi_chat_app_init(esp_xiaozhi_chat_app_t *xiaozhi_chat_
         }
     } while (0);
 
+    if (ret != ESP_OK) {
+        motion_behavior_set_xiaozhi_enabled(false);
+    }
     if (ret != ESP_OK && xiaozhi_chat_app->chat != 0) {
         esp_err_t cleanup_ret = esp_xiaozhi_chat_deinit(xiaozhi_chat_app->chat);
         if (cleanup_ret == ESP_OK) {
@@ -3336,6 +3413,8 @@ static esp_err_t xiaozhi_runtime_enable(void)
 
 static esp_err_t xiaozhi_runtime_disable(void)
 {
+    /* 先撤销小智动作，再关闭网络/音频；迟到的表情/MCP 回调不能重占 PWM。 */
+    motion_behavior_set_xiaozhi_enabled(false);
     if (s_xiaozhi_chat_app == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
@@ -3380,6 +3459,8 @@ static esp_err_t xiaozhi_runtime_disable(void)
     }
 
     xiaozhi_camera_release();
+    s_pairing_announcement[0] = '\0';
+    (void)esp_xiaozhi_chat_display_hide_activation_code();
 
     esp_xiaozhi_chat_display_set_status("AI Disabled");
     return first_error;
@@ -3388,9 +3469,21 @@ static esp_err_t xiaozhi_runtime_disable(void)
 static void xiaozhi_runtime_task(void *arg)
 {
     (void)arg;
+    const TickType_t diagnostics_wait =
+        CONFIG_APP_MEMORY_DIAGNOSTICS_INTERVAL_SECONDS > 0
+            ? pdMS_TO_TICKS(CONFIG_APP_MEMORY_DIAGNOSTICS_INTERVAL_SECONDS * 1000U)
+            : portMAX_DELAY;
+    app_memory_log_heap("runtime_ready");
+    app_memory_log_current_task("runtime_ready");
 
     for (;;) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        /* 超时仅采样，不重试 ERROR 状态，也不触发新的生命周期操作。 */
+        if (ulTaskNotifyTake(pdTRUE, diagnostics_wait) == 0) {
+            app_memory_log_heap("periodic");
+            app_memory_log_current_task("periodic");
+            continue;
+        }
+        app_memory_log_heap("runtime_before");
 
         /* Requests can change while a network or audio lifecycle operation is
          * in progress. Finish the current operation, then converge on the
@@ -3401,12 +3494,31 @@ static void xiaozhi_runtime_task(void *arg)
 
             if (requested) {
                 if (s_runtime_state == ESP_XIAOZHI_CHAT_APP_STATE_ENABLED) {
-                    break;
+                    if (s_runtime_language == app_language_get()) {
+                        break;
+                    }
+                    /* 在原有 lifecycle worker 内重建，不能从 LVGL 回调直接
+                     * 停止网络/音频，也不能同时保留两套 AFE 和聊天资源。 */
+                    ESP_LOGI(TAG, "Language changed; restarting Xiaozhi for %s",
+                             app_language_code());
+                    s_runtime_state = ESP_XIAOZHI_CHAT_APP_STATE_STOPPING;
+                    ret = xiaozhi_runtime_disable();
+                    if (ret != ESP_OK) {
+                        s_runtime_last_error = ret;
+                        s_runtime_state = ESP_XIAOZHI_CHAT_APP_STATE_ERROR;
+                        break;
+                    }
+                    if (!s_runtime_requested) {
+                        s_runtime_state = ESP_XIAOZHI_CHAT_APP_STATE_DISABLED;
+                        continue;
+                    }
                 }
+                const app_language_t language = app_language_get();
                 s_runtime_state = ESP_XIAOZHI_CHAT_APP_STATE_STARTING;
                 ret = xiaozhi_runtime_enable();
                 s_runtime_last_error = ret;
                 if (ret == ESP_OK) {
+                    s_runtime_language = language;
                     s_runtime_state = ESP_XIAOZHI_CHAT_APP_STATE_ENABLED;
                 } else {
                     s_runtime_state = ESP_XIAOZHI_CHAT_APP_STATE_ERROR;
@@ -3425,10 +3537,21 @@ static void xiaozhi_runtime_task(void *arg)
                 s_runtime_state = ESP_XIAOZHI_CHAT_APP_STATE_DISABLED;
             }
 
-            if (s_runtime_requested == requested) {
+            if (s_runtime_requested == requested &&
+                (!requested || s_runtime_language == app_language_get())) {
                 break;
             }
         }
+        app_memory_log_heap("runtime_after");
+        app_memory_log_current_task("runtime_after");
+    }
+}
+
+void esp_xiaozhi_chat_app_notify_language_changed(void)
+{
+    /* 只发通知，关闭 AI 时不改变其开关；启动过程中的变化由 worker 合并。 */
+    if (s_runtime_task != NULL) {
+        xTaskNotifyGive(s_runtime_task);
     }
 }
 
@@ -3436,6 +3559,10 @@ esp_err_t esp_xiaozhi_chat_app_set_enabled(bool enabled)
 {
     if (s_xiaozhi_chat_app == NULL || s_runtime_task == NULL) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (enabled && !wifi_sta_is_connected()) {
+        ESP_LOGW(TAG, "Cannot enable Xiaozhi before WiFi provisioning");
+        return ESP_ERR_WIFI_NOT_CONNECT;
     }
 
     s_settings.xiaozhi_enabled = enabled;
@@ -3558,6 +3685,7 @@ esp_err_t esp_xiaozhi_chat_app(void)
         ESP_LOGW(TAG, "Using default language after load failure: %s",
                  esp_err_to_name(language_ret));
     }
+    s_runtime_language = app_language_get();
     app_sfx_set_enabled(s_settings.ui_sounds_enabled);
     current_volume = s_settings.volume;
     current_brightness = s_settings.brightness;
@@ -3654,38 +3782,32 @@ esp_err_t esp_xiaozhi_chat_app(void)
             ESP_LOGI(TAG, "Xiaozhi disabled by saved settings; skip chat/audio startup");
         }
 
-        /* Network bring-up: connect to stored WiFi credentials.
-         *
-         * - No credentials at all (first boot): provisioning_enter() blocks and
-         *   shows the SoftAP config page; it reboots on success.
-         * - Credentials exist but the AP is unreachable: we wait up to
-         *   WIFI_CONNECT_TIMEOUT_MS; if still not joined, we enter provisioning
-         *   so the user can (re)configure WiFi. Without the network the AI chat
-         *   (emote / conversation) cannot work, so re-pairing is the right move
-         *   rather than leaving the board stuck offline.
+        /* Network bring-up: connect to stored WiFi credentials when available.
+         * Provisioning is deliberately opt-in. A fresh device (or a device
+         * whose AP is temporarily unavailable) must still reach the local UI;
+         * the user can enter Settings -> WLAN -> Configure WiFi when needed.
+         * An explicit request from that UI is handled before this connection
+         * attempt and enters the setup AP after the reboot.
          *
          * wifi_sta_connect_from_nvs() returns:
          *   ESP_OK               -> joined the stored AP
          *   ESP_ERR_NVS_NOT_FOUND / other NVS errors -> no stored creds
          *   ESP_FAIL             -> creds exist but could not connect within the
          *                            timeout window */
-#define WIFI_CONNECT_TIMEOUT_MS 30000   /* 30s: no network -> re-provision */
+#define WIFI_CONNECT_TIMEOUT_MS 30000   /* 30s: give stored AP a chance */
+        if (wifi_provisioning_take_request()) {
+            ESP_LOGI(TAG, "Explicit WiFi provisioning requested");
+            boot_splash_stop();
+            provisioning_enter();
+            return ESP_OK;
+        }
+
         esp_err_t wr = wifi_sta_connect_from_nvs(WIFI_CONNECT_TIMEOUT_MS);
         if (wr == ESP_OK) {
             ESP_LOGI(TAG, "WiFi connected to stored AP");
-        } else if (wr != ESP_FAIL) {
-            /* No stored credentials (first boot / wiped NVS): must provision. */
-            ESP_LOGW(TAG, "No stored WiFi credentials (%s); entering provisioning",
-                     esp_err_to_name(wr));
-            boot_splash_stop();
-            provisioning_enter();   /* blocks; reboots on success; never returns */
         } else {
-            /* Credentials exist but the AP was unreachable within the timeout:
-             * re-enter provisioning so the user can fix the WiFi. */
-            ESP_LOGW(TAG, "WiFi unreachable for %d ms; entering provisioning",
-                     WIFI_CONNECT_TIMEOUT_MS);
-            boot_splash_stop();
-            provisioning_enter();   /* blocks; reboots on success; never returns */
+            ESP_LOGW(TAG, "WiFi unavailable (%s); continuing without network",
+                     esp_err_to_name(wr));
         }
 
         /* Bring up the page UI: persist history, run the page state machine, and

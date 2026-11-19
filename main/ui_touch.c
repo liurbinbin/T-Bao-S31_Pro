@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "ui_touch.h"
+#include "app_memory.h"
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -123,11 +124,13 @@ static void ui_touch_dispatch_task(void *arg)
 {
     (void)arg;
     gesture_msg_t msg;
+    int64_t last_stack_sample_us = 0;
     while (1) {
         if (xQueueReceive(s_gesture_queue, &msg, portMAX_DELAY) == pdTRUE) {
             if (s_cb) {
                 s_cb(msg.g, msg.x, msg.y);
             }
+            app_memory_log_current_task_periodic("touch_dispatch", &last_stack_sample_us);
         }
     }
 }

@@ -112,6 +112,47 @@ float motion_math_ramp_toward(float current, float target, float max_delta)
     return target;
 }
 
+float motion_math_breakaway_min(float effort, float minimum_percent,
+                                float breakaway_percent, float full_effort)
+{
+    if (!isfinite(effort) || !isfinite(minimum_percent) ||
+        !isfinite(breakaway_percent) || !isfinite(full_effort) || full_effort <= 0.0f)
+        return 0.0f;
+    const float minimum = clampf(minimum_percent, 0.0f, 100.0f);
+    const float maximum = clampf(breakaway_percent, minimum, 100.0f);
+    const float ratio = clampf(fabsf(effort) / full_effort, 0.0f, 1.0f);
+    return minimum + (maximum - minimum) * ratio;
+}
+
+float motion_math_ramp_motor(float current, float target,
+                             float max_delta, float brake_delta,
+                             uint32_t step_ms, uint32_t deadtime_ms,
+                             uint32_t *reverse_wait_ms)
+{
+    if (reverse_wait_ms == NULL) return 0.0f;
+    if (target == 0.0f) {
+        *reverse_wait_ms = 0;
+        return motion_math_ramp_toward(current, 0.0f, brake_delta);
+    }
+    const bool opposite = (current > 0.5f && target < -0.5f) ||
+                          (current < -0.5f && target > 0.5f);
+    if (opposite) {
+        const float braking = motion_math_ramp_toward(current, 0.0f, brake_delta);
+        if (fabsf(braking) <= 0.5f) {
+            *reverse_wait_ms = deadtime_ms;
+            return 0.0f;
+        }
+        return braking;
+    }
+    /* 已到零时opposite为假，所以等待必须独立于异号分支。 */
+    if (*reverse_wait_ms > step_ms) {
+        *reverse_wait_ms -= step_ms;
+        return 0.0f;
+    }
+    *reverse_wait_ms = 0;
+    return motion_math_ramp_toward(current, target, max_delta);
+}
+
 void motion_math_limit_twist(const motion_pose_t *pose,
                              motion_twist_t requested,
                              float linear_speed_cm_s,

@@ -6,6 +6,7 @@
 
 #include "esp_err.h"
 #include "motion_math.h"
+#include "motion_calibration.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,8 @@ typedef enum {
     MOTION_SOURCE_WEB,
     MOTION_SOURCE_SAFETY,
     MOTION_SOURCE_FOLLOW,
+    MOTION_SOURCE_CALIBRATION,
+    MOTION_SOURCE_RING,
     MOTION_SOURCE_COUNT,
 } motion_source_t;
 
@@ -68,12 +71,25 @@ void motion_manager_stop(void);
 esp_err_t motion_manager_submit(motion_source_t source,
                                 const motion_request_t *request);
 void motion_manager_clear_source(motion_source_t source);
+/* 禁用时一并撤销这些来源的请求/序列，防止迟到的回调重新占用 PWM。 */
+void motion_manager_set_sources_enabled(uint32_t source_mask, bool enabled);
 esp_err_t motion_manager_start_sequence(motion_source_t source,
                                          const motion_segment_t *segments,
                                          size_t count);
 void motion_manager_stop_all(void);
 void motion_manager_reset_pose(void);
 void motion_manager_get_state(motion_state_t *out_state);
+/* 同行子游戏持有独占权；失联保持独占，退出时清除旧请求而不恢复旧动作。 */
+esp_err_t motion_manager_ring_session(bool active);
+esp_err_t motion_manager_ring_arm(void);
+void motion_manager_ring_stop(void);
+
+/* 校准期间只接收校准/安全请求，其他来源恢复后必须提交新的请求。 */
+esp_err_t motion_manager_calibration_begin(motion_calibration_t *out_config);
+esp_err_t motion_manager_calibration_preview(const motion_calibration_t *config);
+/* 保存仅从内部 RAM 栈的 UI 回调调用；取消不写 NVS。 */
+esp_err_t motion_manager_calibration_finish(bool save);
+void motion_manager_get_calibration(motion_calibration_t *out_config);
 
 #ifdef __cplusplus
 }

@@ -55,6 +55,8 @@ actuator_state_callback_t s_callback = nullptr;
 void *s_callback_context = nullptr;
 int64_t s_last_command_us = 0;
 bool s_initialized = false;
+bool s_motor_pwm_running = false;
+bool s_servo_pwm_running = false;
 
 esp_err_t set_duty(ledc_channel_t channel, uint32_t duty)
 {
@@ -79,25 +81,28 @@ esp_err_t set_motor_gpio_hold(bool held)
     return ESP_OK;
 }
 
+esp_err_t clear_motor_input(ledc_channel_t channel)
+{
+    // 运行中只把非工作桥臂更新为低占空比，保持LEDC输出状态稳定。
+    return set_duty(channel, 0);
+}
+
 esp_err_t set_motor(ledc_channel_t input_1,
                     ledc_channel_t input_2,
                     int percent)
 {
     const uint32_t duty = static_cast<uint32_t>(
         std::abs(percent) * static_cast<int>(kMotorDutyMax) / 100);
-
-    /* Clear both bridge inputs before every direction update. */
-    ESP_RETURN_ON_ERROR(set_duty(input_1, 0), kTag,
-                        "clear motor input 1");
-    ESP_RETURN_ON_ERROR(set_duty(input_2, 0), kTag,
-                        "clear motor input 2");
     if (percent > 0) {
+        ESP_RETURN_ON_ERROR(clear_motor_input(input_2), kTag, "clear motor input 2");
         return set_duty(input_1, duty);
     }
     if (percent < 0) {
+        ESP_RETURN_ON_ERROR(clear_motor_input(input_1), kTag, "clear motor input 1");
         return set_duty(input_2, duty);
     }
-    return ESP_OK;
+    ESP_RETURN_ON_ERROR(clear_motor_input(input_1), kTag, "clear motor input 1");
+    return clear_motor_input(input_2);
 }
 
 uint32_t servo_duty_from_pulse(int pulse_us)
@@ -163,39 +168,122 @@ esp_err_t ensure_servo_power_enabled(bool enabled)
                               "servo power");
 }
 
+esp_err_t stop_motor_pwm_locked()
+{
+    if (!s_motor_pwm_running) {
+        return ESP_OK;
+    }
+    const ledc_channel_t channels[] = {
+        kMotorAIn1Channel, kMotorAIn2Channel,
+        kMotorBIn1Channel, kMotorBIn2Channel,
+    };
+    for (ledc_channel_t channel : channels) {
+        ESP_RETURN_ON_ERROR(ledc_stop(kSpeedMode, channel, 0), kTag,
+                            "stop motor PWM channel");
+    }
+    ESP_RETURN_ON_ERROR(ledc_timer_pause(kSpeedMode, kMotorTimer), kTag,
+                        "pause idle motor timer");
+    s_motor_pwm_running = false;
+    return ESP_OK;
+}
+
+esp_err_t stop_servo_pwm_locked()
+{
+    if (!s_servo_pwm_running) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(ledc_stop(kSpeedMode, kServoChannel, 0), kTag,
+                        "stop servo PWM channel");
+    ESP_RETURN_ON_ERROR(ledc_timer_pause(kSpeedMode, kServoTimer), kTag,
+                        "pause idle servo timer");
+    s_servo_pwm_running = false;
+    return ESP_OK;
+}
+
+void maybe_log_motor_pwm(const actuator_state_t &next)
+{
+    static bool initialized=false,logged_running=false;
+    static int logged_a=0,logged_b=0;
+    static uint32_t last_poll=0;
+    const uint32_t now=static_cast<uint32_t>(esp_timer_get_time()/1000);
+    if(initialized && now-last_poll<500) return;
+    last_poll=now;
+    const uint32_t a=static_cast<uint32_t>(std::abs(next.motor_a_percent))*kMotorDutyMax/100;
+    const uint32_t b=static_cast<uint32_t>(std::abs(next.motor_b_percent))*kMotorDutyMax/100;
+    const uint32_t expected[4]={next.motor_a_percent>0 ? a : 0,next.motor_a_percent<0 ? a : 0,
+                                next.motor_b_percent>0 ? b : 0,next.motor_b_percent<0 ? b : 0};
+    const ledc_channel_t channels[4]={kMotorAIn1Channel,kMotorAIn2Channel,kMotorBIn1Channel,kMotorBIn2Channel};
+    uint32_t readback[4]{};
+    bool mismatch=false;
+    for(unsigned i=0;i<4;++i) {
+        readback[i]=ledc_get_duty(kSpeedMode,channels[i]);
+        // 停止通道可保留旧DUTY寄存器，不能把它当成仍在输出；只比较工作路。
+        if(s_motor_pwm_running && expected[i] && readback[i]!=expected[i]) mismatch=true;
+    }
+    const bool changed=!initialized || logged_a!=next.motor_a_percent || logged_b!=next.motor_b_percent ||
+                        logged_running!=s_motor_pwm_running;
+    if(changed || mismatch) {
+        ESP_LOGI(kTag,"motor_pwm_diag req=(%d,%d) pins=(%d,%d,%d,%d) timer_cmd_running=%u "
+                 "expected_active=(%lu,%lu,%lu,%lu) duty_reg=(%lu,%lu,%lu,%lu) mismatch=%u",
+                 next.motor_a_percent,next.motor_b_percent,int(kMotorPins[0]),int(kMotorPins[1]),int(kMotorPins[2]),int(kMotorPins[3]),
+                 unsigned(s_motor_pwm_running),static_cast<unsigned long>(expected[0]),static_cast<unsigned long>(expected[1]),
+                 static_cast<unsigned long>(expected[2]),static_cast<unsigned long>(expected[3]),
+                 static_cast<unsigned long>(readback[0]),static_cast<unsigned long>(readback[1]),
+                 static_cast<unsigned long>(readback[2]),static_cast<unsigned long>(readback[3]),unsigned(mismatch));
+        if(mismatch) ESP_LOGW(kTag,"active motor duty register differs; inspect PWM channel/configuration (not a pin waveform measurement)");
+        logged_a=next.motor_a_percent; logged_b=next.motor_b_percent; logged_running=s_motor_pwm_running;
+    }
+    initialized=true;
+}
+
 esp_err_t apply_outputs_locked(const actuator_state_t &next)
 {
     const bool motor_active = next.motor_a_percent != 0 ||
                               next.motor_b_percent != 0;
 
-    ESP_RETURN_ON_ERROR(set_motor_gpio_hold(false), kTag,
-                        "release motor GPIO hold");
-    ESP_RETURN_ON_ERROR(set_motor(kMotorAIn1Channel, kMotorAIn2Channel,
-                                  next.motor_a_percent),
-                        kTag, "set motor A");
-    ESP_RETURN_ON_ERROR(set_motor(kMotorBIn1Channel, kMotorBIn2Channel,
-                                  next.motor_b_percent),
-                        kTag, "set motor B");
-    if (!motor_active) {
+    if (!next.servo_enabled) {
+        /* 先停 PWM，再访问共享 I2C，避免 XL9555 超时阻止舵机释放。 */
+        ESP_RETURN_ON_ERROR(stop_servo_pwm_locked(), kTag,
+                            "release idle servo PWM");
+    }
+    if (motor_active) {
+        if (!s_motor_pwm_running) {
+            ESP_RETURN_ON_ERROR(ledc_timer_resume(kSpeedMode, kMotorTimer),
+                                kTag, "resume motor timer for motion");
+            s_motor_pwm_running = true;
+        }
+        ESP_RETURN_ON_ERROR(set_motor_gpio_hold(false), kTag,
+                            "release motor GPIO hold");
+        ESP_RETURN_ON_ERROR(set_motor(kMotorAIn1Channel, kMotorAIn2Channel,
+                                      next.motor_a_percent),
+                            kTag, "set motor A");
+        ESP_RETURN_ON_ERROR(set_motor(kMotorBIn1Channel, kMotorBIn2Channel,
+                                      next.motor_b_percent),
+                            kTag, "set motor B");
+    } else {
+        ESP_RETURN_ON_ERROR(stop_motor_pwm_locked(), kTag,
+                            "release idle motor PWM");
         ESP_RETURN_ON_ERROR(set_motor_gpio_hold(true), kTag,
                             "hold motor GPIOs low");
     }
     ESP_RETURN_ON_ERROR(set_motor_driver_enabled(motor_active), kTag,
                         "set motor driver enable");
+    maybe_log_motor_pwm(next);
 
     if (next.servo_enabled) {
-        const bool was_disabled = !s_state.servo_enabled;
-        ESP_RETURN_ON_ERROR(ensure_servo_power_enabled(true), kTag,
-                            "enable servo power");
-        if (was_disabled) {
+        if (!s_servo_pwm_running) {
+            ESP_RETURN_ON_ERROR(ensure_servo_power_enabled(true), kTag,
+                                "enable servo power");
             vTaskDelay(pdMS_TO_TICKS(kPowerSettleMs));
+            ESP_RETURN_ON_ERROR(ledc_timer_resume(kSpeedMode, kServoTimer),
+                                kTag, "resume servo timer for motion");
+            s_servo_pwm_running = true;
         }
         return set_duty(kServoChannel,
                         servo_duty_from_pulse(next.servo_pulse_us));
     }
 
-    ESP_RETURN_ON_ERROR(set_duty(kServoChannel, 0), kTag,
-                        "disable servo PWM");
+    /* P05 由音频/电源管理共享，不能因舵机空闲而拉低整板供电。 */
     return ensure_servo_power_enabled(false);
 }
 
@@ -359,6 +447,10 @@ extern "C" esp_err_t actuator_control_init(actuator_state_callback_t callback,
     ESP_RETURN_ON_ERROR(configure_channel(kServoChannel, kServoTimer,
                                           TBAO_S31_SERVO_PWM),
                         kTag, "configure servo PWM");
+    /* 配置阶段 timer 已启动；初始零输出会立即 stop 并暂停它们。
+     * timer0/channel0 的背光、timer1 的摄像头均不在此释放范围。 */
+    s_motor_pwm_running = true;
+    s_servo_pwm_running = true;
     ESP_RETURN_ON_ERROR(initialize_expander_controls(), kTag,
                         "initialize XL9555 controls");
 

@@ -5,13 +5,13 @@
 
 #include "esp_log.h"
 #include "esp_check.h"
-#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_lvgl_port.h"
 #include "esp_xiaozhi_chat_app.h"
 #include "esp_xiaozhi_chat_display.h"
 #include "app_face_follow.h"
 #include "app_language.h"
+#include "app_memory.h"
 #include "ui_control_center.h"
 #include "ui_page_style.h"
 #include "lvgl.h"
@@ -300,31 +300,13 @@ esp_err_t ui_page_manager_switch(ui_page_id_t id)
     }
     ESP_LOGI(TAG, "switched to page %d (%s)", s_cur, s_pages[id]->name);
 
-    /* Page builds are the heaviest ordinary LVGL allocation burst. Logging the
-     * internal heap here makes a leak or a page that permanently eats SRAM
-     * visible in the serial log: internal free/largest should return to a
-     * stable plateau after leaving the page, and the largest block must stay
-     * well above the ~100 bytes needed by esp_timer_create() in the Wi-Fi
-     * power-save path. */
-    const size_t internal_free =
-        heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const size_t internal_largest =
-        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (internal_largest < 2048) {
-        ESP_LOGW(TAG,
-                 "internal SRAM low after %s: free=%u largest=%u - Wi-Fi/TLS "
-                 "allocations may fail",
-                 s_pages[id]->name, (unsigned)internal_free,
-                 (unsigned)internal_largest);
-    } else {
-        ESP_LOGI(TAG, "internal SRAM after %s: free=%u largest=%u",
-                 s_pages[id]->name, (unsigned)internal_free,
-                 (unsigned)internal_largest);
-    }
-
+    /* 页面分配完成后记录堆与当前导航任务的栈；先释放 LVGL 锁，
+     * 避免串口输出延长 renderer 的锁占用时间。 */
     if (locked) {
         lvgl_port_unlock();
     }
+    app_memory_log_heap(s_pages[id]->name);
+    app_memory_log_current_task("page_switch");
     return ESP_OK;
 }
 
@@ -371,6 +353,8 @@ void ui_page_manager_tick(uint32_t ms)
         return;
     }
 
+    esp_xiaozhi_chat_display_process_activation();
+
     /* Most on_tick callbacks manipulate LVGL objects and run from an esp_timer
      * callback, NOT the LVGL task, so those callbacks require the port lock.
      * PAGE_FACE is the emote-only exception: capture its callback while the
@@ -395,6 +379,9 @@ void ui_page_manager_tick(uint32_t ms)
  * handoff always run on the LVGL task rather than ui_touch_disp. */
 static void dispatch_gesture_now(ui_gesture_t g, int x, int y)
 {
+    if (esp_xiaozhi_chat_display_activation_popup_visible()) {
+        return;
+    }
     /* The pull-down control center intercepts gestures first: while it is open
      * it consumes everything; a swipe-down when closed opens it. */
     if (ui_control_center_on_gesture(g, x, y)) {
@@ -448,6 +435,10 @@ static void dispatch_gesture_async(void *arg)
 
 void ui_page_manager_dispatch_gesture(ui_gesture_t g, int x, int y)
 {
+    /* 按钮仍由 LVGL 的触摸输入处理，禁止手势导航穿透模态弹窗。 */
+    if (esp_xiaozhi_chat_display_activation_popup_visible()) {
+        return;
+    }
     if (s_cur >= 0 && s_pages[s_cur]->is_direct_mode != NULL &&
         s_pages[s_cur]->is_direct_mode() &&
         s_pages[s_cur]->on_direct_gesture_at != NULL) {

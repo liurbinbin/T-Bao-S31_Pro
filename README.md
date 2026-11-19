@@ -63,11 +63,18 @@ idf.py flash
 
 ### First-time provisioning and model setup
 
-After flashing, follow the on-screen instructions to provision Wi-Fi. Then open [xiaozhi.me](https://xiaozhi.me/), go to the console, choose "Add device" in the upper-right corner, and enter the six-digit code shown on the display or in the serial log to configure the cloud model.
+After flashing, Xiaozhi AI is disabled by default and the device can enter its offline UI without provisioning Wi-Fi. When network access is needed, open Settings -> WLAN -> Configure WiFi and follow the setup prompt. Then open [xiaozhi.me](https://xiaozhi.me/), go to the console, choose "Add device" in the upper-right corner, and enter the six-digit code shown on the display or in the serial log to configure the cloud model.
 
 ### Voice control behavior
 
 After boot, call "你好小智" once. The device responds, but this first response only enters the wake state and does not start a conversation. Call "你好小智" a second time; the device may not respond again, but you can then say something such as "Tell me a joke" to start the conversation. If the device later stops responding, call "你好小智" again to wake it.
+
+### Motion calibration
+
+Open Motion and tap Calib. in the upper-right corner. Other motion sources are paused during calibration. Cancel or leave the page to restore the previous configuration; Save persists it in NVS across restarts and applies it to touch, Web, Xiaozhi, and face-follow control.
+
+- **Wheel direction**: reverse motor A/B independently or swap A/B. The "Fix reported directions" preset addresses left moving forward, right moving backward, backward turning right, and forward turning left. Raise the wheels, hold a direction to verify it, then save. Each wheel test is limited to 1.5 seconds; releasing the button or pressing STOP stops it immediately.
+- **Servo limits**: selecting Low/High, dragging the slider, or using 10 us steps smoothly previews the selected physical pulse. PWM releases automatically within 3 seconds of the last adjustment; Stop preview ends it immediately. Hold Test still stops on release. Endpoints can be previewed independently; Save requires both to be inside 1100–1900 us with at least 100 us separation. Descending pulse values support reversed installation. Stop immediately at a mechanical limit; releasing PWM removes holding torque.
 
 ### Face-follow tuning
 

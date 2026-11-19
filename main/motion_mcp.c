@@ -115,6 +115,8 @@ static const char *source_name(motion_source_t source)
         return "safety";
     case MOTION_SOURCE_FOLLOW:
         return "follow";
+    case MOTION_SOURCE_RING:
+        return "ring";
     default:
         return "none";
     }

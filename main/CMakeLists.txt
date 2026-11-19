@@ -3,17 +3,17 @@ set(SOURCES "esp_xiaozhi_chat_app.c" "esp_xiaozhi_chat_display.c" "app_main.c" "
              "app_sdcard.c"
              "app_mp4_demux.c" "app_avi_demux.c" "app_video_overlay.c" "app_video_player.c"
              "app_recorder.c"
-             "app_settings.c"
-             "app_language.c"
+             "app_settings.c" "app_memory.c"
+             "app_language.c" "app_pairing_code.c"
              "app_camera_preview.c" "app_vision_lite.c" "app_guard_mode.c"
              "app_activity.c"
              "face_target_tracker.c" "face_follow_controller.c" "app_face_follow.cpp"
              "tbao_s31_board.c"
-            "actuator_control.cpp"
-            "motion_math.c" "motion_manager.c" "motion_behavior.c" "motion_mcp.c" "motion_web_server.cpp"
-            "muyu_gif.c" "launcher_icons.c"
+            "actuator_control.cpp" "app_petlink.cpp" "game_pet_companion.c" "pet_companion_avatar.cpp"
+            "motion_math.c" "motion_calibration.c" "motion_manager.c" "motion_behavior.c" "motion_mcp.c" "motion_web_server.cpp"
+            "muyu_gif.c" "launcher_icons.c" "launcher_wallpaper.c"
             "ui_touch.c" "ui_page_manager.c" "ui_control_center.c" "ui_page_style.c"
-            "page_face.c" "page_launcher.c" "page_xiaozhi.c" "page_dialogue.c" "page_camera.c" "page_music.c" "page_video.c" "page_game.c" "page_timer.c" "page_motion.c" "page_face_follow.c"
+            "page_face.c" "page_launcher.c" "page_xiaozhi.c" "page_dialogue.c" "page_camera.c" "page_music.c" "page_video.c" "page_game.c" "page_timer.c" "page_motion.c" "page_motion_calibration.c" "page_face_follow.c"
              "page_emotion.c" "page_settings.c"
              "boot_splash.c"
              "battery_estimator.c" "battery_monitor.c")
@@ -22,6 +22,8 @@ set(INCLUDE_DIRS "." "../components/esp_xiaozhi/src/priv_include")
 idf_component_register(SRCS ${SOURCES}
                        INCLUDE_DIRS ${INCLUDE_DIRS}
                        REQUIRES
+                         petlink
+                         pet_avatar
                          protocol_examples_common
                          esp_board_manager_adapter
                          esp_xiaozhi

@@ -22,7 +22,7 @@ typedef enum {
     APP_VIDEO_PLAYER_PAUSED,
 } app_video_player_state_t;
 
-/** Register the Espressif default MJPEG/H.264 decoders and create controls. */
+/** 注册已启用的 MJPEG decoder 并创建播放控制对象。 */
 esp_err_t app_video_player_init(void);
 
 /** Start one local MP4/AVI file, using a POSIX path such as /sdcard/a.avi. */

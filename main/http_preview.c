@@ -18,6 +18,7 @@
 #include "app_camera.h"
 #include "app_activity.h"
 #include "app_language.h"
+#include "app_memory.h"
 #include "app_recorder.h"
 #include "app_sdcard.h"
 #include "app_music_player.h"
@@ -34,6 +35,8 @@ static const char *TAG = "http_preview";
  * /stream is still available for clients that want it (one viewer at a time). */
 static httpd_handle_t s_server = NULL;          /* port 80: / + /snapshot + /stream */
 static bool s_running = false;
+/* 仅由本实例的 HTTP 任务访问，停止服务后在下一次启动时重置。 */
+static int64_t s_last_stack_sample_us;
 
 static esp_err_t stream_handler(httpd_req_t *req)
 {
@@ -89,6 +92,7 @@ static esp_err_t stream_handler(httpd_req_t *req)
             httpd_resp_send_chunk(req, (const char *)frame, flen) != ESP_OK) {
             break;   /* client closed or socket error */
         }
+        app_memory_log_current_task_periodic("camera_stream", &s_last_stack_sample_us);
         /* ~18fps; the browser's <img> repaints each arrived frame. Keeping the
          * yield prevents the task from starving other work while still being
          * fluid enough for a live preview. */
@@ -119,6 +123,7 @@ static esp_err_t snapshot_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Content-Length", clen);
     httpd_resp_send(req, (const char *)buf, len);
     app_camera_release_jpeg(buf);
+    app_memory_log_current_task_periodic("camera_snapshot", &s_last_stack_sample_us);
     return ESP_OK;
 }
 
@@ -721,6 +726,7 @@ esp_err_t http_preview_start(void)
     if (s_running) {
         return ESP_OK;
     }
+    s_last_stack_sample_us = 0;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = 80;
     config.task_priority = 4;

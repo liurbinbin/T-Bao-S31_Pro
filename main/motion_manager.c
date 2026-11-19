@@ -23,6 +23,8 @@
 #define MOTION_MOTOR_B_SIGN 1.0f
 #define MOTION_MOTOR_MAX_PERCENT 100.0f
 #define MOTION_MOTOR_MIN_PERCENT 18.0f
+#define MOTION_RING_BREAKAWAY_PERCENT 40.0f
+#define MOTION_RING_BREAKAWAY_EFFORT 0.08f
 /* Face-follow commands deliberately use a small angular range (max 0.10).
  * Increase breakaway torque continuously with the requested turn instead of
  * switching abruptly at one angular threshold. */
@@ -75,8 +77,15 @@ static float s_current_servo_pulse_us;
 static uint32_t s_reverse_wait_a;
 static uint32_t s_reverse_wait_b;
 static request_slot_t s_requests[MOTION_SOURCE_COUNT];
+static uint32_t s_enabled_sources = (1U << MOTION_SOURCE_COUNT) - 1U;
 static sequence_state_t s_sequence;
 static motion_state_t s_state;
+static motion_calibration_t s_calibration;
+static motion_calibration_t s_calibration_before;
+static bool s_calibrating;
+static bool s_ring_exclusive;
+static bool s_ring_authorized;
+static void calibration_stop_locked(void);
 static bool s_servo_diag_initialized;
 static motion_source_t s_servo_diag_source;
 static int s_servo_diag_target_us;
@@ -96,6 +105,8 @@ static uint32_t s_motor_diag_last_ms;
 
 static const motion_source_t s_source_priority[] = {
     MOTION_SOURCE_SAFETY,
+    MOTION_SOURCE_CALIBRATION,
+    MOTION_SOURCE_RING,
     MOTION_SOURCE_WEB,
     MOTION_SOURCE_TOUCH,
     MOTION_SOURCE_MCP,
@@ -138,6 +149,10 @@ static const char *motion_source_name(motion_source_t source)
         return "safety";
     case MOTION_SOURCE_FOLLOW:
         return "follow";
+    case MOTION_SOURCE_CALIBRATION:
+        return "calibration";
+    case MOTION_SOURCE_RING:
+        return "ring";
     case MOTION_SOURCE_NONE:
     default:
         return "none";
@@ -286,6 +301,14 @@ static float motor_min_percent_for_command(
     const selected_command_t *selected, motion_twist_t requested)
 {
     if (selected != NULL && selected->valid &&
+        selected->source == MOTION_SOURCE_RING) {
+        /* 只补偿联动的倒车/转向起转；不改变其它来源，零mix仍由映射返回零。 */
+        const float effort = fmaxf(fabsf(requested.angular), fmaxf(0.0f, -requested.linear));
+        return motion_math_breakaway_min(effort, MOTION_MOTOR_MIN_PERCENT,
+                                         MOTION_RING_BREAKAWAY_PERCENT,
+                                         MOTION_RING_BREAKAWAY_EFFORT);
+    }
+    if (selected != NULL && selected->valid &&
         selected->source == MOTION_SOURCE_FOLLOW) {
         const float turn_ratio = clampf(
             fabsf(requested.angular) / MOTION_FOLLOW_TURN_KICK_ANGULAR,
@@ -382,31 +405,11 @@ static float ramp_motor(float current,
                         uint32_t ramp_ms,
                         uint32_t *reverse_wait_ms)
 {
-    const bool opposite = (current > 0.5f && target < -0.5f) ||
-                          (current < -0.5f && target > 0.5f);
-    if (opposite) {
-        if (fabsf(current) > 0.5f) {
-            if (*reverse_wait_ms == 0) {
-                *reverse_wait_ms = MOTION_REVERSE_DEADTIME_MS;
-            }
-            return motion_math_ramp_toward(
-                current, 0.0f, ramp_delta(0.0f, ramp_ms));
-        }
-        if (*reverse_wait_ms > 0) {
-            *reverse_wait_ms = *reverse_wait_ms > MOTION_MANAGER_PERIOD_MS
-                                   ? *reverse_wait_ms - MOTION_MANAGER_PERIOD_MS
-                                   : 0;
-            return 0.0f;
-        }
-    } else if (target == 0.0f ||
-               (current == 0.0f && target == 0.0f) ||
-               (current > 0.0f && target >= 0.0f) ||
-               (current < 0.0f && target <= 0.0f)) {
-        *reverse_wait_ms = 0;
-    }
-
-    return motion_math_ramp_toward(current, target,
-                                   ramp_delta(target, ramp_ms));
+    return motion_math_ramp_motor(current, target,
+                                   ramp_delta(target, ramp_ms),
+                                   ramp_delta(0.0f, ramp_ms),
+                                   MOTION_MANAGER_PERIOD_MS,
+                                   MOTION_REVERSE_DEADTIME_MS, reverse_wait_ms);
 }
 
 static float ramp_servo_pulse(float current, int target)
@@ -510,6 +513,7 @@ static void manager_step(void)
     motion_math_mix_wheels(limited.linear, limited.angular,
                            MOTION_TURN_GAIN,
                            MOTION_MOTOR_A_SIGN, MOTION_MOTOR_B_SIGN, &mix);
+    motion_calibration_apply_wheels(&s_calibration, &mix);
     const float motor_min_percent =
         motor_min_percent_for_command(&selected, limited);
     const int target_a = motion_math_normalized_to_percent(
@@ -524,10 +528,8 @@ static void manager_step(void)
 
     const int output_a = (int)lroundf(s_current_motor_a);
     const int output_b = (int)lroundf(s_current_motor_b);
-    /* Idle and motor-only commands must not synthesize a center command. Keep
-     * the last servo target and PWM hold once a source has claimed the servo,
-     * so a page transition or a no-face interval cannot make the head drift
-     * before the next real tracking sample arrives. */
+    /* 空闲时只保留最后的脉宽记录，不保持 PWM 锁力；没有有效的舵机
+     * 请求就关闭输出，下一次真实动作从记录的位置继续限速移动。 */
     /* Wheel arbitration and camera arbitration are independent. A manual
      * wheel request with servo_enabled=false means "I do not control the
      * camera", not "turn off the active face-follow servo". */
@@ -543,7 +545,7 @@ static void manager_step(void)
         s_current_servo_pulse_us,
         (float)ACTUATOR_SERVO_PULSE_MIN_US,
         (float)ACTUATOR_SERVO_PULSE_MAX_US));
-    const bool servo_enabled = servo_command || s_state.servo_enabled;
+    const bool servo_enabled = servo_command;
 
     if (has_command) {
         motion_math_integrate_pose(&s_state.pose, limited,
@@ -568,8 +570,12 @@ static void manager_step(void)
     s_state.sequence_index = s_sequence.index;
     s_state.sequence_count = s_sequence.count;
 
+    /* 普通命令保留逻辑坐标，所有来源统一在最终输出处应用端点校准。
+     * 校准试位直接使用安全范围内的实际脉宽，不做二次映射。 */
+    const int physical_servo_output = s_calibrating ? servo_output :
+        motion_calibration_servo_to_physical(&s_calibration, servo_output);
     const esp_err_t apply_ret = actuator_control_apply(
-        output_a, output_b, servo_output, servo_enabled);
+        output_a, output_b, physical_servo_output, servo_enabled);
     if (apply_ret != ESP_OK) {
         ESP_LOGE(TAG, "actuator apply failed: %s; locking motion",
                  esp_err_to_name(apply_ret));
@@ -636,8 +642,20 @@ esp_err_t motion_manager_init(void)
         }
     }
 
+    motion_calibration_t calibration;
+    const esp_err_t calibration_ret = motion_calibration_load(&calibration);
+    if (calibration_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Using default motion calibration: %s",
+                 esp_err_to_name(calibration_ret));
+    }
     if (xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
+        s_calibration = calibration;
+        s_calibration_before = calibration;
+        s_calibrating = false;
+        s_ring_exclusive = false;
+        s_ring_authorized = false;
         memset(s_requests, 0, sizeof(s_requests));
+        s_enabled_sources = (1U << MOTION_SOURCE_COUNT) - 1U;
         memset(&s_sequence, 0, sizeof(s_sequence));
         memset(&s_state, 0, sizeof(s_state));
         s_state.pose = (motion_pose_t){15.0f, 15.0f, 0.0f};
@@ -748,6 +766,28 @@ esp_err_t motion_manager_submit(motion_source_t source,
     if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
+    if ((s_ring_exclusive && source != MOTION_SOURCE_RING && source != MOTION_SOURCE_SAFETY) ||
+        (!s_ring_exclusive && source == MOTION_SOURCE_RING) ||
+        (s_calibrating && source != MOTION_SOURCE_CALIBRATION &&
+         source != MOTION_SOURCE_SAFETY) ||
+        (!s_calibrating && source == MOTION_SOURCE_CALIBRATION)) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if ((s_enabled_sources & (1U << source)) == 0) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (source == MOTION_SOURCE_RING && !s_ring_authorized) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (source == MOTION_SOURCE_SAFETY) {
+        s_ring_authorized = false;
+        s_requests[MOTION_SOURCE_RING].valid = false;
+        if (s_sequence.valid && s_sequence.source == MOTION_SOURCE_RING)
+            memset(&s_sequence, 0, sizeof(s_sequence));
+    }
     s_requests[source].valid = true;
     s_requests[source].request = *request;
     s_requests[source].expires_at_ms = now_ms() + request->ttl_ms;
@@ -766,6 +806,33 @@ void motion_manager_clear_source(motion_source_t source)
             memset(&s_sequence, 0, sizeof(s_sequence));
         }
         xSemaphoreGive(s_mutex);
+    }
+}
+
+void motion_manager_set_sources_enabled(uint32_t source_mask, bool enabled)
+{
+    source_mask &= (1U << MOTION_SOURCE_COUNT) - 1U;
+    if (source_mask == 0 || s_mutex == NULL ||
+        xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    if (enabled) {
+        s_enabled_sources |= source_mask;
+    } else {
+        s_enabled_sources &= ~source_mask;
+        for (int i = 0; i < MOTION_SOURCE_COUNT; ++i) {
+            if ((source_mask & (1U << i)) != 0) {
+                s_requests[i].valid = false;
+            }
+        }
+        if (s_sequence.valid && (source_mask & (1U << s_sequence.source)) != 0) {
+            memset(&s_sequence, 0, sizeof(s_sequence));
+        }
+    }
+    xSemaphoreGive(s_mutex);
+    if (!enabled) {
+        /* 立刻重新仲裁：释放小智舵机输出，仍保留其他有效来源的控制。 */
+        manager_step();
     }
 }
 
@@ -793,7 +860,21 @@ esp_err_t motion_manager_start_sequence(motion_source_t source,
     if (xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
         return ESP_ERR_TIMEOUT;
     }
-    if (s_sequence.valid && source < s_sequence.source) {
+    if ((s_ring_exclusive && source != MOTION_SOURCE_RING && source != MOTION_SOURCE_SAFETY) ||
+        (!s_ring_exclusive && source == MOTION_SOURCE_RING) ||
+        (s_calibrating && source != MOTION_SOURCE_CALIBRATION &&
+         source != MOTION_SOURCE_SAFETY) ||
+        (!s_calibrating && source == MOTION_SOURCE_CALIBRATION)) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if ((s_enabled_sources & (1U << source)) == 0) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_sequence.valid &&
+        ((s_sequence.source == MOTION_SOURCE_SAFETY && source != MOTION_SOURCE_SAFETY) ||
+         (source < s_sequence.source && source != MOTION_SOURCE_SAFETY))) {
         xSemaphoreGive(s_mutex);
         return ESP_ERR_INVALID_STATE;
     }
@@ -811,6 +892,7 @@ void motion_manager_stop_all(void)
 {
     int held_servo_pulse_us = MOTION_DEFAULT_SERVO_PULSE_US;
     if (s_mutex != NULL && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
+        s_ring_authorized = false;
         clear_all_requests_locked();
         s_current_motor_a = 0.0f;
         s_current_motor_b = 0.0f;
@@ -848,6 +930,158 @@ void motion_manager_reset_pose(void)
     s_state.pose = (motion_pose_t){15.0f, 15.0f, 0.0f};
     s_state.boundary_limited = false;
     xSemaphoreGive(s_mutex);
+}
+
+static void calibration_stop_locked(void)
+{
+    clear_all_requests_locked();
+    s_current_motor_a = 0.0f;
+    s_current_motor_b = 0.0f;
+    s_reverse_wait_a = 0;
+    s_reverse_wait_b = 0;
+    s_state.current_motor_a_percent = 0;
+    s_state.current_motor_b_percent = 0;
+    s_state.target_motor_a_percent = 0;
+    s_state.target_motor_b_percent = 0;
+    s_state.requested_twist = (motion_twist_t){0.0f, 0.0f};
+    s_state.limited_twist = s_state.requested_twist;
+    s_state.servo_enabled = false;
+    s_state.active_source = MOTION_SOURCE_NONE;
+    s_state.sequence_active = false;
+    s_state.sequence_index = 0;
+    s_state.sequence_count = 0;
+    actuator_control_stop_all(false);
+}
+
+esp_err_t motion_manager_ring_session(bool active)
+{
+    if (s_mutex == NULL || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE)
+        return ESP_ERR_INVALID_STATE;
+    if (!active && !s_ring_exclusive) {
+        xSemaphoreGive(s_mutex);
+        return ESP_OK;
+    }
+    if (active && (!s_available || s_faulted || s_calibrating ||
+        request_active(&s_requests[MOTION_SOURCE_SAFETY], now_ms()) ||
+        (s_sequence.valid && s_sequence.source == MOTION_SOURCE_SAFETY))) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 先在同一把锁内停车、清掉序列，再切换所有权，避免交接窗口写入 PWM。 */
+    calibration_stop_locked();
+    s_ring_authorized = false;
+    s_ring_exclusive = active;
+    xSemaphoreGive(s_mutex);
+    return ESP_OK;
+}
+
+esp_err_t motion_manager_ring_arm(void)
+{
+    if (s_mutex == NULL || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE)
+        return ESP_ERR_INVALID_STATE;
+    if (!s_ring_exclusive || !s_available || s_faulted || s_calibrating ||
+        request_active(&s_requests[MOTION_SOURCE_SAFETY], now_ms()) ||
+        (s_sequence.valid && s_sequence.source == MOTION_SOURCE_SAFETY)) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    calibration_stop_locked();
+    s_ring_authorized = true;
+    xSemaphoreGive(s_mutex);
+    return ESP_OK;
+}
+
+void motion_manager_ring_stop(void)
+{
+    if (s_mutex != NULL && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
+        s_ring_authorized = false;
+        if (s_ring_exclusive) calibration_stop_locked();
+        xSemaphoreGive(s_mutex);
+    }
+}
+
+esp_err_t motion_manager_calibration_begin(motion_calibration_t *out_config)
+{
+    if (out_config == NULL || s_mutex == NULL ||
+        xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_available || s_faulted || s_calibrating || s_ring_exclusive) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    calibration_stop_locked();
+    s_calibration_before = s_calibration;
+    *out_config = s_calibration;
+    /* 试位阶段改用实际脉宽记录，避免进入/退出校准时头部跳位。 */
+    s_current_servo_pulse_us = (float)motion_calibration_servo_to_physical(
+        &s_calibration, (int)lroundf(s_current_servo_pulse_us));
+    s_state.current_servo_pulse_us = (int)lroundf(s_current_servo_pulse_us);
+    s_calibrating = true;
+    xSemaphoreGive(s_mutex);
+    return ESP_OK;
+}
+
+esp_err_t motion_manager_calibration_preview(const motion_calibration_t *config)
+{
+    if (!motion_calibration_valid(config)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_mutex == NULL || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_calibrating) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    /* 必须先停车再改变轮向，不能让正在运行的电机瞬间反转。 */
+    calibration_stop_locked();
+    s_calibration = *config;
+    /* 当前板级接线固定：A 轮反向且交换 A/B，忽略旧配置中的可变值。 */
+    s_calibration.reverse_a = true;
+    s_calibration.swap_motors = true;
+    xSemaphoreGive(s_mutex);
+    return ESP_OK;
+}
+
+esp_err_t motion_manager_calibration_finish(bool save)
+{
+    if (s_mutex == NULL || xSemaphoreTake(s_mutex, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_calibrating) {
+        xSemaphoreGive(s_mutex);
+        return ESP_OK;
+    }
+    calibration_stop_locked();
+    if (save) {
+        const esp_err_t ret = motion_calibration_save(&s_calibration);
+        if (ret != ESP_OK) {
+            /* 保存失败仍留在校准状态，允许重试或取消，不能假装保存成功。 */
+            xSemaphoreGive(s_mutex);
+            return ret;
+        }
+    } else {
+        s_calibration = s_calibration_before;
+    }
+    s_current_servo_pulse_us = (float)motion_calibration_servo_to_logical(
+        &s_calibration, (int)lroundf(s_current_servo_pulse_us));
+    s_state.current_servo_pulse_us = (int)lroundf(s_current_servo_pulse_us);
+    s_calibrating = false;
+    xSemaphoreGive(s_mutex);
+    return ESP_OK;
+}
+
+void motion_manager_get_calibration(motion_calibration_t *out_config)
+{
+    if (out_config == NULL) {
+        return;
+    }
+    motion_calibration_defaults(out_config);
+    if (s_mutex != NULL && xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
+        *out_config = s_calibration;
+        xSemaphoreGive(s_mutex);
+    }
 }
 
 void motion_manager_get_state(motion_state_t *out_state)

@@ -74,6 +74,9 @@ esp_err_t esp_xiaozhi_chat_app(void);
  */
 esp_err_t esp_xiaozhi_chat_app_set_enabled(bool enabled);
 
+/** 语言保存后通知后台同步；AI 关闭时不自动启动，也不阻塞 UI。 */
+void esp_xiaozhi_chat_app_notify_language_changed(void);
+
 /** @brief Ensure the shared speaker path and music decoder are available. */
 esp_err_t esp_xiaozhi_chat_app_prepare_music(void);
 

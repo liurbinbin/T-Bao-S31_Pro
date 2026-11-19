@@ -1,6 +1,8 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,6 +45,14 @@ int motion_math_normalized_to_percent(float normalized,
                                       float maximum_percent);
 
 float motion_math_ramp_toward(float current, float target, float max_delta);
+
+/* 电机百分比斜坡：制动至零之后才开始换向等待，等待不依赖current仍异号。 */
+float motion_math_ramp_motor(float current, float target,
+                             float max_delta, float brake_delta,
+                             uint32_t step_ms, uint32_t deadtime_ms,
+                             uint32_t *reverse_wait_ms);
+float motion_math_breakaway_min(float effort, float minimum_percent,
+                                float breakaway_percent, float full_effort);
 
 void motion_math_limit_twist(const motion_pose_t *pose,
                              motion_twist_t requested,

@@ -8,10 +8,12 @@
  * Boot flow (wired into esp_xiaozhi_chat_app after the display is up):
  *   1. wifi_sta_connect_from_nvs() tries to join the home AP using credentials
  *      previously stored in NVS ("wifi_creds").
- *   2. If no creds / cannot connect -> provisioning_enter() starts an OPEN SoftAP
- *      "Xiaozhi-XXXX", a tiny HTTP config page at http://192.168.4.1, and a DNS
- *      redirect so phones auto-open the page. The screen shows the AP name.
- *      On submit, creds are saved to NVS and the chip reboots into station mode.
+ *   2. Provisioning is started explicitly from the WLAN settings page (the
+ *      reset request is consumed on the following boot). It starts an OPEN
+ *      SoftAP "Xiaozhi-XXXX", a tiny HTTP config page at
+ *      http://192.168.4.1, and a DNS redirect so phones auto-open the page.
+ *      On submit, creds are saved to NVS and the chip reboots into station
+ *      mode. A missing or unreachable network never blocks normal startup.
  */
 
 #include <string.h>
@@ -54,8 +56,51 @@ LV_FONT_DECLARE(font_puhui_20_4);
 
 static EventGroupHandle_t s_wifi_evt = NULL;
 static bool s_wifi_inited = false;
+static bool s_petlink_hold_reconnect = false;
+static bool s_petlink_ps_changed = false;
+static wifi_ps_type_t s_petlink_previous_ps = WIFI_PS_MIN_MODEM;
+static volatile bool s_wifi_connected = false;
 static SemaphoreHandle_t s_prov_done = NULL;
 static char s_saved_ssid[33] = {0};
+static volatile bool s_reset_task_started = false;
+
+#define WIFI_PROVISIONING_REQUEST_KEY "provisioning_requested"
+
+static const char *wifi_disconnect_reason_name(uint8_t reason)
+{
+    switch (reason) {
+    case WIFI_REASON_AUTH_EXPIRE: return "auth_expire";
+    case WIFI_REASON_AUTH_LEAVE: return "auth_leave";
+    case WIFI_REASON_ASSOC_LEAVE: return "assoc_leave";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: return "4way_handshake_timeout";
+    case WIFI_REASON_BEACON_TIMEOUT: return "beacon_timeout";
+    case WIFI_REASON_NO_AP_FOUND: return "no_ap_found";
+    case WIFI_REASON_AUTH_FAIL: return "auth_fail";
+    case WIFI_REASON_ASSOC_FAIL: return "assoc_fail";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT: return "handshake_timeout";
+    case WIFI_REASON_CONNECTION_FAIL: return "connection_fail";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+        return "no_compatible_security";
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        return "authmode_threshold";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:
+        return "rssi_threshold";
+    default: return "unknown";
+    }
+}
+
+static void wifi_log_connected_info(void)
+{
+    wifi_ap_record_t record = {0};
+    if (esp_wifi_sta_get_ap_info(&record) == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "STA connected: SSID=\"%.32s\", RSSI=%d dBm, channel=%u, authmode=%d",
+                 (const char *)record.ssid, record.rssi, record.primary,
+                 record.authmode);
+    } else {
+        ESP_LOGI(TAG, "STA connected: RSSI unavailable");
+    }
+}
 
 /* One DISCONNECTED event must NOT fail the connect attempt: WiFi drops once
  * during association (roaming, transient RF, AP busy). We re-issue
@@ -66,23 +111,100 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                                int32_t id, void *data)
 {
     if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        s_wifi_connected = true;
+        wifi_log_connected_info();
         xEventGroupSetBits(s_wifi_evt, WIFI_CONNECTED_BIT);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_wifi_connected = false;
+        const wifi_event_sta_disconnected_t *event =
+            (const wifi_event_sta_disconnected_t *)data;
+        const uint8_t reason = event != NULL ? event->reason : 0;
+        const int rssi = event != NULL ? event->rssi : 0;
+        ESP_LOGW(TAG,
+                 "STA disconnected: reason=%u (%s), rssi=%d; %s",
+                 reason, wifi_disconnect_reason_name(reason), rssi,
+                 __atomic_load_n(&s_petlink_hold_reconnect, __ATOMIC_ACQUIRE) ? "companion offline channel" : "retrying");
         /* Keep the link trying in the background. esp_wifi_connect() is async
          * and the WiFi driver applies its own backoff between association
          * attempts, so this does not create a tight loop even on a burst of
          * DISCONNECTED events. We never set WIFI_FAIL_BIT here: the caller's
          * timeout decides when to stop waiting. */
-        esp_wifi_connect();
+        if (!__atomic_load_n(&s_petlink_hold_reconnect, __ATOMIC_ACQUIRE))
+            esp_wifi_connect();
     }
+}
+
+esp_err_t wifi_prepare_petlink(void)
+{
+    /* 已联网或正在重连时绝不改模式、信道或重复初始化。 */
+    if (s_wifi_inited) return ESP_OK;
+    if (esp_netif_get_handle_from_ifkey("WIFI_STA_DEF") == NULL) {
+        if (esp_netif_create_default_wifi_sta() == NULL) return ESP_ERR_NO_MEM;
+    }
+    wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
+    esp_err_t err = esp_wifi_init(&config);
+    if (err != ESP_OK) return err;
+    err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err == ESP_OK) err = esp_wifi_start();
+    if (err != ESP_OK) { esp_wifi_deinit(); return err; }
+    s_wifi_inited = true;
+    return ESP_OK;
+}
+
+esp_err_t wifi_petlink_enter(void)
+{
+    /* 仅在同行期间关闭 STA 省电，退出恢复，避免 DTIM 睡眠打断控制接收。 */
+    if (!s_petlink_ps_changed) {
+        esp_err_t power = esp_wifi_get_ps(&s_petlink_previous_ps);
+        if (power != ESP_OK) return power;
+        power = esp_wifi_set_ps(WIFI_PS_NONE);
+        if (power != ESP_OK) return power;
+        s_petlink_ps_changed = true;
+    }
+    /* 保留现有 STA 连接；若同行途中 AP 掉线，也先保持当前信道，
+     * 不让后台重连扫描连续打断 ESP-NOW。退出后再恢复 STA 重连。 */
+    __atomic_store_n(&s_petlink_hold_reconnect, true, __ATOMIC_RELEASE);
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) return ESP_OK;
+    /* 有凭据但 AP 不可达时，连接扫描会不断换信道；同行期间暂缓重连，
+     * 只在未关联时固定合法信道，不干扰已经关联的网络。 */
+    esp_wifi_disconnect();
+    esp_wifi_scan_stop();
+    wifi_country_t country = {0};
+    uint8_t channel = 1;
+    if (esp_wifi_get_country(&country) == ESP_OK && country.schan) channel = country.schan;
+    esp_err_t err = esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+    if (err != ESP_OK) wifi_petlink_leave();
+    return err;
+}
+
+void wifi_petlink_leave(void)
+{
+    if (s_petlink_ps_changed) {
+        esp_wifi_set_ps(s_petlink_previous_ps);
+        s_petlink_ps_changed = false;
+    }
+    if (__atomic_exchange_n(&s_petlink_hold_reconnect, false, __ATOMIC_ACQ_REL) && s_wifi_evt != NULL) {
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) esp_wifi_connect();
+    }
+}
+
+bool wifi_sta_is_connected(void)
+{
+    /* Only IP_EVENT_STA_GOT_IP marks the station usable. The WiFi driver may
+     * retain a previous AP record while it is retrying authentication, which
+     * would otherwise make the UI report a false connection. */
+    return s_wifi_connected;
 }
 
 esp_err_t wifi_sta_connect_from_nvs(int timeout_ms)
 {
+    s_wifi_connected = false;
     nvs_handle_t nvs;
     esp_err_t r = nvs_open("wifi_creds", NVS_READONLY, &nvs);
     if (r != ESP_OK) {
-        ESP_LOGW(TAG, "No stored WiFi credentials (NVS %s) -> need provisioning",
+        ESP_LOGW(TAG, "No stored WiFi credentials (NVS %s)",
                  esp_err_to_name(r));
         return r;
     }
@@ -141,11 +263,40 @@ esp_err_t wifi_sta_connect_from_nvs(int timeout_ms)
         s_wifi_evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
         pdTRUE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
     if (bits & WIFI_CONNECTED_BIT) {
+        s_wifi_connected = true;
         ESP_LOGI(TAG, "WiFi connected (station)");
         return ESP_OK;
     }
+    s_wifi_connected = false;
     ESP_LOGW(TAG, "WiFi connect failed/timeout after %d ms", timeout_ms);
     return ESP_FAIL;
+}
+
+bool wifi_provisioning_take_request(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t ret = nvs_open("wifi_creds", NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        return false;
+    }
+
+    uint8_t requested = 0;
+    ret = nvs_get_u8(nvs, WIFI_PROVISIONING_REQUEST_KEY, &requested);
+    if (ret != ESP_OK || requested == 0) {
+        nvs_close(nvs);
+        return false;
+    }
+
+    esp_err_t clear_ret = nvs_erase_key(nvs, WIFI_PROVISIONING_REQUEST_KEY);
+    if (clear_ret == ESP_OK) {
+        clear_ret = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    if (clear_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to clear provisioning request: %s",
+                 esp_err_to_name(clear_ret));
+    }
+    return true;
 }
 
 /* ---- HTTP config page ---- */
@@ -541,20 +692,54 @@ void provisioning_enter(void)
     /* never returns */
 }
 
-void wifi_creds_erase_and_reboot(void)
+static void wifi_creds_reset_task(void *arg)
 {
-    ESP_LOGI(TAG, "Erasing stored WiFi credentials and rebooting");
+    (void)arg;
+    ESP_LOGI(TAG, "Erasing stored WiFi credentials and scheduling provisioning");
+
+    bool request_saved = false;
     nvs_handle_t nvs;
     if (nvs_open("wifi_creds", NVS_READWRITE, &nvs) == ESP_OK) {
-        nvs_erase_all(nvs);
-        nvs_commit(nvs);
+        esp_err_t erase_ret = nvs_erase_all(nvs);
+        esp_err_t request_ret = erase_ret == ESP_OK
+            ? nvs_set_u8(nvs, WIFI_PROVISIONING_REQUEST_KEY, 1) : erase_ret;
+        esp_err_t commit_ret = request_ret == ESP_OK
+            ? nvs_commit(nvs) : request_ret;
+        request_saved = erase_ret == ESP_OK && request_ret == ESP_OK &&
+                        commit_ret == ESP_OK;
         nvs_close(nvs);
-        ESP_LOGI(TAG, "WiFi credentials erased");
+        if (request_saved) {
+            ESP_LOGI(TAG, "WiFi credentials erased; provisioning requested");
+        } else {
+            ESP_LOGE(TAG, "Failed to save provisioning request");
+        }
     } else {
         ESP_LOGW(TAG, "No wifi_creds namespace to erase");
     }
-    /* Let the UI show a short confirmation before the reboot. */
+
+    /* Let the UI show a short confirmation before the reboot. The next boot
+     * consumes the request and enters provisioning outside the LVGL task. */
     vTaskDelay(pdMS_TO_TICKS(800));
+    if (!request_saved) {
+        /* If NVS could not hold the request, still provide the explicitly
+         * requested setup flow. This task is independent of LVGL, so the
+         * provisioning screen can safely take the LVGL lock. */
+        provisioning_enter();
+    }
     esp_restart();
-    /* never returns */
+}
+
+void wifi_creds_erase_and_reboot(void)
+{
+    if (s_reset_task_started) {
+        return;
+    }
+    s_reset_task_started = true;
+
+    BaseType_t ret = xTaskCreate(wifi_creds_reset_task, "wifi_reset", 4096,
+                                 NULL, 5, NULL);
+    if (ret != pdPASS) {
+        s_reset_task_started = false;
+        ESP_LOGE(TAG, "Failed to start WiFi reset task");
+    }
 }

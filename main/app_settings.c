@@ -9,9 +9,11 @@
 
 #define APP_SETTINGS_NAMESPACE "app_settings"
 #define APP_SETTINGS_KEY_XIAOZHI "xiaozhi_enabled"
+#define APP_SETTINGS_KEY_XIAOZHI_DEFAULT_VERSION "xiaozhi_default_version"
 #define APP_SETTINGS_KEY_UI_SOUNDS "ui_sounds_enabled"
 #define APP_SETTINGS_KEY_VOLUME  "volume"
 #define APP_SETTINGS_KEY_BRIGHT  "brightness"
+#define APP_SETTINGS_XIAOZHI_DEFAULT_VERSION 1
 #define APP_SETTINGS_DEFAULT_VOLUME 80
 #define APP_SETTINGS_DEFAULT_BRIGHTNESS 80
 
@@ -19,7 +21,10 @@ static const char *TAG = "APP_SETTINGS";
 
 static void app_settings_set_defaults(app_settings_t *settings)
 {
-    settings->xiaozhi_enabled = true;
+    /* Keep a freshly flashed device quiet until the user explicitly enables
+     * Xiaozhi from the AI settings page. The load path performs a one-time
+     * migration for older saved settings before honoring future user choices. */
+    settings->xiaozhi_enabled = false;
     settings->ui_sounds_enabled = true;
     settings->volume = APP_SETTINGS_DEFAULT_VOLUME;
     settings->brightness = APP_SETTINGS_DEFAULT_BRIGHTNESS;
@@ -34,7 +39,9 @@ esp_err_t app_settings_load(app_settings_t *settings)
     app_settings_set_defaults(settings);
 
     nvs_handle_t handle;
-    esp_err_t ret = nvs_open(APP_SETTINGS_NAMESPACE, NVS_READONLY, &handle);
+    /* READWRITE is intentional: this firmware needs a one-time migration for
+     * devices that already have an older saved value of xiaozhi_enabled. */
+    esp_err_t ret = nvs_open(APP_SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
     if (ret == ESP_ERR_NVS_NOT_FOUND) {
         return ESP_OK;
     }
@@ -44,7 +51,9 @@ esp_err_t app_settings_load(app_settings_t *settings)
     }
 
     uint8_t enabled = 0;
-    if (nvs_get_u8(handle, APP_SETTINGS_KEY_XIAOZHI, &enabled) == ESP_OK) {
+    const bool has_saved_xiaozhi =
+        nvs_get_u8(handle, APP_SETTINGS_KEY_XIAOZHI, &enabled) == ESP_OK;
+    if (has_saved_xiaozhi) {
         settings->xiaozhi_enabled = enabled != 0;
     }
     enabled = 1;
@@ -60,6 +69,29 @@ esp_err_t app_settings_load(app_settings_t *settings)
     if (nvs_get_i32(handle, APP_SETTINGS_KEY_BRIGHT, &value) == ESP_OK &&
         value >= 5 && value <= 100) {
         settings->brightness = (int)value;
+    }
+
+    uint8_t default_version = 0;
+    if (nvs_get_u8(handle, APP_SETTINGS_KEY_XIAOZHI_DEFAULT_VERSION,
+                   &default_version) != ESP_OK ||
+        default_version != APP_SETTINGS_XIAOZHI_DEFAULT_VERSION) {
+        /* This is the first boot of the new default policy. Override an old
+         * saved 'on' value once, then leave future user choices untouched. */
+        settings->xiaozhi_enabled = false;
+        esp_err_t migration_ret = nvs_set_u8(
+            handle, APP_SETTINGS_KEY_XIAOZHI_DEFAULT_VERSION,
+            APP_SETTINGS_XIAOZHI_DEFAULT_VERSION);
+        if (migration_ret == ESP_OK) {
+            migration_ret = nvs_set_u8(handle, APP_SETTINGS_KEY_XIAOZHI,
+                                        0);
+        }
+        if (migration_ret == ESP_OK) {
+            migration_ret = nvs_commit(handle);
+        }
+        if (migration_ret != ESP_OK) {
+            ESP_LOGW(TAG, "save Xiaozhi default migration failed: %s",
+                     esp_err_to_name(migration_ret));
+        }
     }
 
     nvs_close(handle);

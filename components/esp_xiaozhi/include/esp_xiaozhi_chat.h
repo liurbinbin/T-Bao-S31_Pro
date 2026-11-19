@@ -88,6 +88,7 @@ typedef enum {
     ESP_XIAOZHI_CHAT_EVENT_CHAT_EMOJI,               /*!< event_data = const char * (LLM emotion) */
     ESP_XIAOZHI_CHAT_EVENT_CHAT_TTS_STATE,           /*!< event_data = esp_xiaozhi_chat_tts_state_t * (protocol TTS state) */
     ESP_XIAOZHI_CHAT_EVENT_CHAT_SYSTEM_CMD,          /*!< event_data = const char * (e.g. "reboot"); app decides whether to execute */
+    ESP_XIAOZHI_CHAT_EVENT_CHAT_ALERT,               /*!< 服务端提示文本，const char * 仅在回调期间有效 */
 } esp_xiaozhi_chat_event_t;
 
 /**

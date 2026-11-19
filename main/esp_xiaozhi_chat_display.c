@@ -16,6 +16,7 @@
 #include "widget/gfx_anim.h"
 #include "ui_page_manager.h"
 #include "app_language.h"
+#include "app_pairing_code.h"
 
 #include <esp_err.h>
 #include <esp_check.h>
@@ -117,6 +118,9 @@ typedef struct display {
     lv_obj_t *shutdown_popup;
     lv_obj_t *shutdown_countdown_label;
     lv_obj_t *shutdown_close_button;
+    lv_obj_t *activation_popup;
+    char activation_code[APP_PAIRING_CODE_DIGITS + 1];
+    bool activation_dirty;
     bool shutdown_countdown_active;
     bool shutdown_countdown_dismissed;
     const char *battery_icon;
@@ -157,6 +161,8 @@ static const char *TAG = "ESP_XIAOZHI_CHAT_DISPLAY";
 static bool s_lvgl_inited;
 static bool s_lvgl_port_inited;
 static display_t *s_display = NULL;
+static bool s_activation_popup_visible = false;
+static bool s_activation_update_queued = false;
 
 static const struct {
     const char *text;
@@ -268,6 +274,7 @@ static void emote_record_current_index(size_t index)
  * are also used by the page-manager-facing helpers above. */
 static bool esp_xiaozhi_chat_display_lock(display_t *disp, int timeout_ms);
 static void esp_xiaozhi_chat_display_unlock(display_t *disp);
+static void activation_popup_update_async(void *arg);
 static esp_err_t esp_xiaozhi_chat_display_sync_panel(lcd_display_t *lcd);
 static bool emote_on_flush_done(esp_lcd_panel_io_handle_t panel_io,
                                 esp_lcd_panel_io_event_data_t *edata,
@@ -747,11 +754,15 @@ esp_err_t esp_xiaozhi_chat_display_enable_emote(void)
     }
     emote_set_status_event("Ready");
 
-    /* The animated face now owns the panel. Switch the renderer into FACE mode
-     * after the first animation is ready. The next frame callback refreshes the
-     * complete canvas without requiring an emote call from this handoff. */
-    esp_xiaozhi_chat_display_set_face_visible(true);
-    return ESP_OK;
+    /* 初始化期间也可能收到验证码并进入小智页；不能在这里强行
+     * 把 LCD 交回表情，否则会覆盖刚显示的配对弹窗。 */
+    if (!esp_xiaozhi_chat_display_lock(s_display, 1000)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    ret = esp_xiaozhi_chat_display_set_face_visible(
+        ui_page_manager_current() == PAGE_FACE);
+    esp_xiaozhi_chat_display_unlock(s_display);
+    return ret;
 }
 
 static esp_err_t esp_xiaozhi_chat_display_sync_panel(lcd_display_t *lcd)
@@ -1384,6 +1395,13 @@ static esp_err_t esp_xiaozhi_chat_display_destroy(display_t *disp)
 {
     ESP_RETURN_ON_FALSE(disp, ESP_ERR_INVALID_STATE, TAG, "Display not initialized");
 
+    lv_async_call_cancel(activation_popup_update_async, NULL);
+    s_activation_update_queued = false;
+    __atomic_store_n(&s_activation_popup_visible, false, __ATOMIC_RELEASE);
+    if (disp->activation_popup != NULL) {
+        lv_obj_del(disp->activation_popup);
+        disp->activation_popup = NULL;
+    }
     if (disp->notification_timer != NULL) {
         esp_timer_stop(disp->notification_timer);
         esp_timer_delete(disp->notification_timer);
@@ -1561,7 +1579,8 @@ static void lcd_display_perf_event_cb(lv_event_t *event)
         const uint64_t elapsed_us = (uint64_t)(now_us - lcd->perf.window_start_us);
         const uint32_t fps_x100 = (uint32_t)((uint64_t)lcd->perf.refresh_count * 100000000ULL / elapsed_us);
         const uint64_t pixels_per_sec = lcd->perf.pixels * 1000000ULL / elapsed_us;
-        ESP_LOGI(TAG,
+        /* 性能统计仅在 DEBUG 输出，避免常规日志干扰 SRAM 分析。 */
+        ESP_LOGD(TAG,
                  "LCD perf: fps=%" PRIu32 ".%02" PRIu32 " flush=%" PRIu32
                  " pixels/s=%" PRIu64 " dma_wait=%" PRIu64 " ms",
                  fps_x100 / 100, fps_x100 % 100, lcd->perf.flush_count,
@@ -2057,6 +2076,189 @@ esp_err_t esp_xiaozhi_chat_display_set_notification(const char *notification, in
         esp_timer_start_once(s_display->notification_timer, (uint64_t)duration_ms * 1000ULL);
     }
     return ESP_OK;
+}
+
+static void activation_popup_close_locked(void)
+{
+    if (s_display->activation_popup != NULL) {
+        lv_obj_del(s_display->activation_popup);
+        s_display->activation_popup = NULL;
+    }
+    __atomic_store_n(&s_activation_popup_visible, false, __ATOMIC_RELEASE);
+}
+
+static void activation_popup_close_cb(lv_event_t *event)
+{
+    (void)event;
+    /* 保留本次验证码，避免同一段播报/重试反复打开已关闭的弹窗。 */
+    activation_popup_close_locked();
+}
+
+bool esp_xiaozhi_chat_display_activation_popup_visible(void)
+{
+    return __atomic_load_n(&s_activation_popup_visible, __ATOMIC_ACQUIRE);
+}
+
+esp_err_t esp_xiaozhi_chat_display_show_activation_code(const char *code)
+{
+    ESP_RETURN_ON_FALSE(code != NULL && strlen(code) == APP_PAIRING_CODE_DIGITS,
+                        ESP_ERR_INVALID_ARG, TAG, "Invalid activation code");
+    for (size_t i = 0; i < APP_PAIRING_CODE_DIGITS; ++i) {
+        ESP_RETURN_ON_FALSE(code[i] >= '0' && code[i] <= '9',
+                            ESP_ERR_INVALID_ARG, TAG, "Invalid activation digit");
+    }
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG,
+                        "Display not initialized");
+    if (!esp_xiaozhi_chat_display_lock(s_display, 100)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (strcmp(s_display->activation_code, code) != 0) {
+        memcpy(s_display->activation_code, code, sizeof(s_display->activation_code));
+        s_display->activation_dirty = true;
+    }
+    esp_xiaozhi_chat_display_unlock(s_display);
+    return ESP_OK;
+}
+
+esp_err_t esp_xiaozhi_chat_display_hide_activation_code(void)
+{
+    ESP_RETURN_ON_ERROR(esp_xiaozhi_chat_display_required(), TAG,
+                        "Display not initialized");
+    if (!esp_xiaozhi_chat_display_lock(s_display, 100)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    if (s_display->activation_code[0] != '\0' ||
+        s_display->activation_popup != NULL) {
+        s_display->activation_code[0] = '\0';
+        s_display->activation_dirty = true;
+    }
+    esp_xiaozhi_chat_display_unlock(s_display);
+    return ESP_OK;
+}
+
+static void activation_popup_update_async(void *arg)
+{
+    (void)arg;
+    if (s_display == NULL || !esp_xiaozhi_chat_display_lock(s_display, 0)) {
+        return;
+    }
+    s_activation_update_queued = false;
+    if (!s_display->activation_dirty) {
+        esp_xiaozhi_chat_display_unlock(s_display);
+        return;
+    }
+    if (s_display->activation_code[0] == '\0') {
+        activation_popup_close_locked();
+        s_display->activation_dirty = false;
+        if (s_face_visible || s_video_visible) {
+            lv_timer_enable(false);
+        }
+        esp_xiaozhi_chat_display_unlock(s_display);
+        return;
+    }
+
+    /* 先通过页面生命周期退出视频/表情渲染，再显示 LVGL 弹窗。
+     * 导航在 LVGL 上下文执行，不占用 WebSocket 或 esp_timer 任务。 */
+    if (ui_page_manager_switch(PAGE_XIAOZHI) != ESP_OK) {
+        esp_xiaozhi_chat_display_unlock(s_display);
+        return;
+    }
+    activation_popup_close_locked();
+    lv_obj_t *overlay = lv_obj_create(lv_layer_top());
+    if (overlay == NULL) {
+        esp_xiaozhi_chat_display_unlock(s_display);
+        return;
+    }
+    s_display->activation_popup = overlay;
+    lv_obj_remove_style_all(overlay);
+    lv_obj_set_size(overlay, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_style_bg_color(overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(overlay, LV_OPA_70, 0);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *card = lv_obj_create(overlay);
+    if (card == NULL) {
+        goto allocation_failed;
+    }
+    lv_obj_set_size(card, LV_HOR_RES - 44, 244);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x142333), 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0x398DEB), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_pad_all(card, 12, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(card);
+    lv_obj_t *digits = lv_label_create(card);
+    lv_obj_t *hint = lv_label_create(card);
+    lv_obj_t *button = lv_btn_create(card);
+    if (title == NULL || digits == NULL || hint == NULL || button == NULL) {
+        goto allocation_failed;
+    }
+    lv_label_set_text(title, app_language_text("小智配对验证码", "Xiaozhi pairing code"));
+    lv_obj_set_style_text_font(title, &font_puhui_20_4, 0);
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 4);
+
+    lv_label_set_text(digits, s_display->activation_code);
+    lv_obj_set_style_text_font(digits, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(digits, lv_color_hex(0x8DC7FF), 0);
+    lv_obj_align(digits, LV_ALIGN_TOP_MID, 0, 44);
+
+    lv_label_set_text(hint, app_language_text(
+        "打开 xiaozhi.me 控制台\n选择添加设备，输入上方验证码",
+        "Open the xiaozhi.me console.\nChoose Add device and enter this code."));
+    lv_obj_set_width(hint, LV_HOR_RES - 76);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(hint, &font_puhui_20_4, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0xC3D0DE), 0);
+    lv_obj_set_style_text_align(hint, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 88);
+
+    lv_obj_set_size(button, 116, 36);
+    lv_obj_align(button, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x398DEB), 0);
+    lv_obj_add_event_cb(button, activation_popup_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *label = lv_label_create(button);
+    if (label == NULL) {
+        goto allocation_failed;
+    }
+    lv_label_set_text(label, app_language_text("知道了", "OK"));
+    lv_obj_set_style_text_font(label, &font_puhui_20_4, 0);
+    lv_obj_center(label);
+    /* 电量关机保护必须保持在配对提示之上。 */
+    if (s_display->shutdown_popup != NULL) {
+        lv_obj_move_foreground(s_display->shutdown_popup);
+    }
+    s_display->activation_dirty = false;
+    __atomic_store_n(&s_activation_popup_visible, true, __ATOMIC_RELEASE);
+    esp_xiaozhi_chat_display_unlock(s_display);
+    return;
+
+allocation_failed:
+    activation_popup_close_locked();
+    esp_xiaozhi_chat_display_unlock(s_display);
+}
+
+void esp_xiaozhi_chat_display_process_activation(void)
+{
+    if (s_display == NULL || !esp_xiaozhi_chat_display_lock(s_display, 0)) {
+        return;
+    }
+    if (s_display->activation_dirty && !s_activation_update_queued) {
+        if (lv_async_call(activation_popup_update_async, NULL) == LV_RESULT_OK) {
+            s_activation_update_queued = true;
+            /* 表情主页暂停了 LVGL timer，需唤醒它执行一次异步交接。
+             * 未完成 renderer 交接前，flush owner 仍会阻止 LVGL 直刷。 */
+            if (s_face_visible || s_video_visible) {
+                lv_timer_enable(true);
+            }
+            lvgl_port_task_wake(LVGL_PORT_EVENT_USER, NULL);
+        }
+    }
+    esp_xiaozhi_chat_display_unlock(s_display);
 }
 
 esp_err_t esp_xiaozhi_chat_display_show_shutdown_countdown(int seconds)

@@ -1,4 +1,14 @@
 menu "Xiaozhi Chat Application"
+    config APP_MEMORY_DIAGNOSTICS_INTERVAL_SECONDS
+        int "内存与任务栈周期采样间隔（秒，0 为关闭）"
+        range 0 3600
+        default 60
+        help
+            复用现有任务采样，不创建新任务，也不暂停全系统扫描任务栈。
+            记录内部堆、内部 DMA 堆和 PSRAM 的剩余量、低水位及最大连续块。
+            已接入的任务自行记录最小剩余栈，单位为字节。
+            设置为 0 仅关闭周期采样，保留启动、页面与 AI 生命周期检查点。
+
     menuconfig TBAO_CAMERA_SUPPORT
         bool "Enable T-Bao S31 camera"
         default y

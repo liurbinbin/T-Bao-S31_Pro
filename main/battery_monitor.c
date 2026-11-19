@@ -2,6 +2,7 @@
 
 #include "battery_estimator.h"
 #include "app_language.h"
+#include "app_memory.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_check.h"
@@ -828,6 +829,7 @@ static void battery_monitor_task(void *arg)
     battery_monitor_state_t last_sample = {0};
     bool have_last_sample = false;
     unsigned sample_count = 0;
+    int64_t last_stack_sample_us = 0;
 
     while (true) {
         battery_monitor_state_t state;
@@ -850,7 +852,8 @@ static void battery_monitor_task(void *arg)
                 .sampled_at = xTaskGetTickCount(),
             };
             (void)xQueueOverwrite(s_sample_queue, &sample);
-            ESP_LOGI(TAG, "USB输入：%dmA 电池充电：%dmA",
+            /* 常规电流遥测仅在 DEBUG 输出，告警与保护日志保持原级别。 */
+            ESP_LOGD(TAG, "USB输入：%dmA 电池充电：%dmA",
                      state.ibus_ma, state.ichg_ma);
             const bool state_changed = !have_last_sample ||
                 state.valid != last_sample.valid ||
@@ -872,7 +875,7 @@ static void battery_monitor_task(void *arg)
                 state.fault_bits != last_sample.fault_bits ||
                 state.ntc_state != last_sample.ntc_state;
             if (state_changed || (sample_count % 10U) == 0U) {
-                ESP_LOGI(TAG,
+                ESP_LOGD(TAG,
                          "valid=%d USB=%d PG=%d/%d phase=%s charging=%d "
                          "VBUS=%dmV VBAT=%dmV ICHG=%dmA percent=%d "
                          "current_detected=%d nCE=%s EN_CHG=%d HIZ=%d "
@@ -898,6 +901,7 @@ static void battery_monitor_task(void *arg)
             have_last_sample = true;
             ++sample_count;
         }
+        app_memory_log_current_task_periodic("battery_sample", &last_stack_sample_us);
         vTaskDelay(pdMS_TO_TICKS(BATTERY_MONITOR_SAMPLE_PERIOD_MS));
     }
 }

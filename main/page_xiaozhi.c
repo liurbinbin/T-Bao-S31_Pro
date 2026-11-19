@@ -9,6 +9,7 @@
 #include "app_sfx.h"
 #include "app_language.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
 #include "esp_xiaozhi_chat_app.h"
 #include "esp_xiaozhi_chat_display.h"
 #include "font_awesome_symbols.h"
@@ -16,6 +17,7 @@
 #include "page_launcher.h"
 #include "ui_page_style.h"
 #include "launcher_icons.h"
+#include "wifi_provisioning.h"
 
 LV_FONT_DECLARE(font_awesome_30_4);
 LV_FONT_DECLARE(font_puhui_16_4);
@@ -28,6 +30,7 @@ static lv_obj_t *s_toggle_label = NULL;
 static lv_obj_t *s_state_dot = NULL;
 static uint32_t s_last_refresh_ms = 0;
 static bool s_toggle_request_error = false;
+static bool s_toggle_requires_wifi = false;
 
 static const char *TAG = "PAGE_XIAOZHI";
 
@@ -69,7 +72,11 @@ static void page_xiaozhi_refresh(void)
         lv_obj_set_style_bg_color(s_state_dot, lv_color_hex(color), 0);
     }
     if (s_detail != NULL) {
-        if (s_toggle_request_error) {
+        if (s_toggle_requires_wifi) {
+            lv_label_set_text(s_detail, app_language_text(
+                "请先完成 WiFi 配网，再开启小智 AI",
+                "Please configure WiFi before enabling Xiaozhi AI"));
+        } else if (s_toggle_request_error) {
             lv_label_set_text(s_detail, app_language_text("小智 AI 控制未就绪，请稍后重试", "Xiaozhi is not ready. Please try again."));
         } else if (busy) {
             lv_label_set_text(s_detail, app_language_text("正在处理，请稍候...", "Processing, please wait..."));
@@ -130,10 +137,12 @@ static void page_xiaozhi_toggle_cb(lv_event_t *e)
         ESP_LOGW(TAG, "failed to %s Xiaozhi: %s",
                  enable ? "enable" : "disable", esp_err_to_name(ret));
         s_toggle_request_error = true;
+        s_toggle_requires_wifi = ret == ESP_ERR_WIFI_NOT_CONNECT;
         page_xiaozhi_refresh();
         return;
     }
     s_toggle_request_error = false;
+    s_toggle_requires_wifi = false;
     page_xiaozhi_refresh();
 }
 
@@ -277,6 +286,7 @@ esp_err_t page_xiaozhi_on_exit(void)
     s_toggle_label = NULL;
     s_state_dot = NULL;
     s_toggle_request_error = false;
+    s_toggle_requires_wifi = false;
     return ESP_OK;
 }
 

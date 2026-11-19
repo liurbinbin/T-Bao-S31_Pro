@@ -45,7 +45,10 @@
  * could walk the face out of frame. Scale the right-hand dose down instead of
  * lowering its drive, so the wheel duty stays above the gearbox breakaway. */
 #define FACE_FOLLOW_DEFAULT_YAW_RIGHT_PULSE_SCALE 0.60f
-// 垂直舵机 PID
+/* Camera x coordinates are mirrored relative to the calibrated chassis yaw:
+ * a face on screen-right needs the positive (manual-page left) command to
+ * bring it back toward the image center on this board. */
+#define FACE_FOLLOW_DEFAULT_YAW_SIGN 1.0f
 #define FACE_FOLLOW_DEFAULT_VERTICAL_KP 360.0f
 #define FACE_FOLLOW_DEFAULT_VERTICAL_KI 20.0f
 #define FACE_FOLLOW_DEFAULT_VERTICAL_KD 4.0f
@@ -387,9 +390,10 @@ static float horizontal_command_for_target(
 
     const float drive =
         target->predicted ? config->yaw_predicted_drive : config->yaw_drive;
-    /* Positive offset means the face is to screen-right; the negative angular
-     * command turns the chassis that way. */
-    return offset_px > 0.0f ? -drive : drive;
+    /* Positive offset is screen-right; this board's camera is mirrored, so
+     * use the calibrated positive yaw command to turn the chassis inward. */
+    return FACE_FOLLOW_DEFAULT_YAW_SIGN *
+           (offset_px > 0.0f ? drive : -drive);
 }
 
 static bool valid_config(const face_follow_controller_config_t *config)

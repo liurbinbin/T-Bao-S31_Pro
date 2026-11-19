@@ -16,6 +16,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_xiaozhi_chat_app.h"
+#include "app_memory.h"
 
 static const char *TAG = "app_main";
 
@@ -53,6 +54,7 @@ void app_main(void)
      * panic (backtrace is printed by the panic handler) or a brownout/power
      * event; this line makes the two distinguishable in the next log. */
     ESP_LOGI(TAG, "reset reason: %d", (int)esp_reset_reason());
+    app_memory_log_heap("boot");
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -65,9 +67,9 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     /* WiFi is owned by the chat app now: it connects to stored credentials
-     * and, if none are configured, enters SoftAP provisioning (the board
-     * broadcasts its own AP + a captive-portal config page). We must NOT call
-     * example_connect() here too, or wifi would be initialized twice. */
+     * when available and continues offline when none are configured. WiFi
+     * provisioning is explicitly started from the WLAN settings page. We must
+     * NOT call example_connect() here too, or WiFi would be initialized twice. */
 
     /* The chat app brings up the board (LCD/emote), connects to the xiaozhi AI
      * service, and (if the audio codec is reachable) voice. With the board
@@ -75,4 +77,7 @@ void app_main(void)
      * network failure, the device stays alive (screen lit) even when audio
      * hardware or WiFi are temporarily unavailable. */
     esp_xiaozhi_chat_app();
+    /* 此时 main 栈尚未回收；后续周期日志可观察回收后的稳态堆。 */
+    app_memory_log_heap("boot_ready");
+    app_memory_log_current_task("boot_ready");
 }

@@ -17,6 +17,7 @@
 #include "actuator_control.h"
 #include "app_face_follow.h"
 #include "app_language.h"
+#include "app_memory.h"
 #include "motion_behavior.h"
 #include "motion_manager.h"
 
@@ -117,7 +118,7 @@ function sendMotion(){if(!active&&!servoEnabled.checked){return}servoControlOwne
 function releaseMotion(){active=false;pointerId=null;motionPending=false;if(motionAbort!==null)motionAbort.abort();resetKnob();if(servoEnabled.checked){sendMotion()}else{queueAction('/api/release')}}
 function beaconRelease(){active=false;pointerId=null;motionPending=false;servoEnabled.checked=false;servoControlOwned=false;stateRequestSerial++;if(motionAbort!==null)motionAbort.abort();pendingAction='';resetKnob();navigator.sendBeacon('/api/release','');}
 function setLink(text,kind){const node=$('link');node.textContent=text;node.className=kind||'';}
-function sourceLabel(source){if(uiEnglish)return source||'Idle';return {Web:'网页',Touch:'触摸',MCP:'MCP',Voice:'语音',Expression:'表情',Safety:'安全保护',Follow:'跟随',Idle:'空闲'}[source]||source||'空闲'}
+function sourceLabel(source){if(uiEnglish)return source||'Idle';return {Web:'网页',Touch:'触摸',MCP:'MCP',Voice:'语音',Expression:'表情',Safety:'安全保护',Follow:'跟随',Ring:'指环',Idle:'空闲'}[source]||source||'空闲'}
 function applyState(s){uiEnglish=s.language==='en';applyLanguage();if(typeof s.webEpoch==='number'&&s.webEpoch>=webEpoch){webEpoch=s.webEpoch}if(!s.available)setLink(tr('运动不可用','Motion unavailable'),'bad');else if(s.faulted)setLink(tr('故障锁定','Fault locked'),'bad');else if(s.failsafe)setLink(tr('保护停车','Safety stop'),'warn');else setLink(tr('在线','Online'),'');$('motors').textContent=`A ${s.motorA}% · B ${s.motorB}%`;$('pose').textContent=`${Number(s.poseX).toFixed(1)}, ${Number(s.poseY).toFixed(1)} cm`;$('heading').textContent=`${s.headingDeg}°`;$('source').textContent=sourceLabel(s.source);$('safety').textContent=s.boundaryLimited?tr('边界限制','Boundary limited'):tr('软件边界关闭','Software boundary off');if(!servoControlOwned){const nextServoUs=Number(s.servoUs);if(Number.isFinite(nextServoUs)&&nextServoUs>=1100&&nextServoUs<=1900){servoUs.value=nextServoUs}if(typeof s.servoEnabled==='boolean'){servoEnabled.checked=s.servoEnabled}}paintVector();}
 pad.addEventListener('pointerdown',ev=>{active=true;pointerId=ev.pointerId;pad.setPointerCapture(pointerId);setPoint(ev);sendMotion()});pad.addEventListener('pointermove',ev=>{if(active&&ev.pointerId===pointerId){setPoint(ev)}});pad.addEventListener('pointerup',releaseMotion);pad.addEventListener('pointercancel',releaseMotion);pad.addEventListener('lostpointercapture',()=>{if(active)releaseMotion()});speed.addEventListener('input',()=>{paintVector();if(active||servoEnabled.checked)sendMotion()});servoUs.addEventListener('input',()=>{servoControlOwned=true;servoEnabled.checked=true;paintVector();sendMotion()});servoEnabled.addEventListener('change',()=>{servoControlOwned=true;paintVector();if(servoEnabled.checked)sendMotion();else queueAction('/api/release')});$('centerServo').addEventListener('click',()=>{servoControlOwned=true;servoUs.value=1500;servoEnabled.checked=true;paintVector();sendMotion()});$('stop').addEventListener('click',()=>queueAction('/api/stop'));setInterval(()=>{if(active||servoEnabled.checked)sendMotion()},50);setInterval(loadState,250);document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')beaconRelease()});window.addEventListener('pagehide',beaconRelease);async function loadState(){const requestSerial=++stateRequestSerial;try{const r=await fetch('/api/state',{cache:'no-store'});if(!r.ok)throw new Error('state');if(requestSerial!==stateRequestSerial)return;applyState(await r.json())}catch(e){if(e.name!=='AbortError')setLink(tr('连接失败','Connection failed'),'bad')}}paintVector();loadState();
 </script>
@@ -141,6 +142,8 @@ const char *source_name(motion_source_t source)
         return "Safety";
     case MOTION_SOURCE_FOLLOW:
         return "Follow";
+    case MOTION_SOURCE_RING:
+        return "Ring";
     default:
         return "Idle";
     }
@@ -182,7 +185,10 @@ esp_err_t send_state(httpd_req_t *request)
     }
     httpd_resp_set_type(request, "application/json");
     httpd_resp_set_hdr(request, "Cache-Control", "no-store");
-    return httpd_resp_send(request, response, length);
+    const esp_err_t result = httpd_resp_send(request, response, length);
+    static int64_t last_stack_sample_us = 0;
+    app_memory_log_current_task_periodic("motion_http", &last_stack_sample_us);
+    return result;
 }
 
 esp_err_t index_handler(httpd_req_t *request)

@@ -27,14 +27,12 @@ static const char *TAG = "ESP_XIAOZHI_BOARD";
 
 static const char *board_language_code(void)
 {
-    static char code[6] = "zh-CN";
+    const char *code = "zh-CN";
     nvs_handle_t handle;
     if (nvs_open("app_settings", NVS_READONLY, &handle) == ESP_OK) {
         uint8_t language = 0;
         if (nvs_get_u8(handle, "language", &language) == ESP_OK && language == 1) {
-            memcpy(code, "en-US", sizeof(code));
-        } else {
-            memcpy(code, "zh-CN", sizeof(code));
+            code = "en-US";
         }
         nvs_close(handle);
     }

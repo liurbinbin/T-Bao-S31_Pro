@@ -20,6 +20,7 @@
 
 static const char *TAG = "MOTION_BEHAVIOR";
 static bool s_ready;
+static bool s_xiaozhi_enabled;
 
 static const char *skip_ascii_space(const char *text)
 {
@@ -123,7 +124,25 @@ esp_err_t motion_behavior_init(void)
     }
     motion_manager_reset_pose();
     s_ready = true;
+    motion_behavior_set_xiaozhi_enabled(false);
     return ESP_OK;
+}
+
+void motion_behavior_set_xiaozhi_enabled(bool enabled)
+{
+    if (!s_ready) {
+        return;
+    }
+    const uint32_t xiaozhi_sources = (1U << MOTION_SOURCE_EXPRESSION) |
+                                     (1U << MOTION_SOURCE_VOICE) |
+                                     (1U << MOTION_SOURCE_MCP);
+    if (!enabled) {
+        __atomic_store_n(&s_xiaozhi_enabled, false, __ATOMIC_RELEASE);
+    }
+    motion_manager_set_sources_enabled(xiaozhi_sources, enabled);
+    if (enabled) {
+        __atomic_store_n(&s_xiaozhi_enabled, true, __ATOMIC_RELEASE);
+    }
 }
 
 void motion_behavior_submit_manual(float linear, float angular)
@@ -289,9 +308,18 @@ esp_err_t motion_behavior_start_named(motion_behavior_action_t action)
     return start_named_for_source(MOTION_SOURCE_MCP, action);
 }
 
+esp_err_t motion_behavior_start_manual_named(motion_behavior_action_t action)
+{
+    if (!s_ready) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return start_named_for_source(MOTION_SOURCE_TOUCH, action);
+}
+
 void motion_behavior_on_user_text(const char *text)
 {
-    if (!s_ready || text == NULL || text[0] == '\0') {
+    if (!s_ready || !__atomic_load_n(&s_xiaozhi_enabled, __ATOMIC_ACQUIRE) ||
+        text == NULL || text[0] == '\0') {
         return;
     }
 
@@ -344,7 +372,8 @@ static void start_expression(const motion_segment_t *segments, size_t count)
 
 void motion_behavior_on_emotion(const char *emotion)
 {
-    if (!s_ready || emotion == NULL) {
+    if (!s_ready || !__atomic_load_n(&s_xiaozhi_enabled, __ATOMIC_ACQUIRE) ||
+        emotion == NULL) {
         return;
     }
 

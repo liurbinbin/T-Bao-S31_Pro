@@ -634,6 +634,17 @@ static esp_err_t esp_xiaozhi_chat_system_handler(esp_xiaozhi_chat_t *xiaozhi_cha
     return ESP_OK;
 }
 
+static esp_err_t esp_xiaozhi_chat_alert_handler(esp_xiaozhi_chat_t *xiaozhi_chat, cJSON *root)
+{
+    cJSON *message = cJSON_GetObjectItem(root, "message");
+    if (cJSON_IsString(message) && xiaozhi_chat->event_callback != NULL) {
+        xiaozhi_chat->event_callback(ESP_XIAOZHI_CHAT_EVENT_CHAT_ALERT,
+                                   message->valuestring,
+                                   xiaozhi_chat->event_callback_ctx);
+    }
+    return ESP_OK;
+}
+
 static esp_err_t esp_xiaozhi_chat_binary_handler(esp_xiaozhi_transport_handle_t handle, const uint8_t *data, size_t data_len)
 {
     esp_xiaozhi_chat_t *xiaozhi_chat = esp_xiaozhi_chat_get_by_transport(handle);
@@ -682,6 +693,7 @@ static esp_err_t esp_xiaozhi_chat_data_handler(esp_xiaozhi_transport_handle_t ha
         { "stt",     esp_xiaozhi_chat_stt_handler },
         { "llm",     esp_xiaozhi_chat_llm_handler },
         { "system",  esp_xiaozhi_chat_system_handler },
+        { "alert",   esp_xiaozhi_chat_alert_handler },
     };
 
     for (size_t i = 0; i < sizeof(esp_xiaozhi_chat_type_handlers) / sizeof(esp_xiaozhi_chat_type_handlers[0]); i++) {

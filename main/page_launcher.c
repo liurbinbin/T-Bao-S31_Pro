@@ -21,6 +21,7 @@
 #include "src/draw/lv_draw_image.h"
 #include "src/draw/lv_draw_label.h"
 #include "launcher_icons.h"
+#include "launcher_wallpaper.h"
 #include "font_awesome_symbols.h"
 #include "ui_page_style.h"
 
@@ -31,8 +32,9 @@
 #define LAUNCHER_VIEW_H       LV_VER_RES
 #define LAUNCHER_CACHE_W      LV_HOR_RES
 #define LAUNCHER_CACHE_H      LAUNCHER_VIEW_H
+/* ARGB8888 让图标缓存层保持透明，从而显示底部壁纸。 */
 #define LAUNCHER_CACHE_BYTES  ((size_t)LAUNCHER_CACHE_W * \
-                               (size_t)LAUNCHER_CACHE_H * sizeof(lv_color_t))
+                               (size_t)LAUNCHER_CACHE_H * sizeof(lv_color32_t))
 #define LAUNCHER_BUBBLE_SIZE  56
 #define LAUNCHER_MIN_OFFSET_X (-48.0f)
 #define LAUNCHER_MAX_OFFSET_X 48.0f
@@ -78,7 +80,7 @@ static const launcher_item_t s_items[LAUNCHER_N] = {
 static lv_obj_t *s_grid = NULL;
 static lv_obj_t *s_cache_canvas = NULL;
 static lv_obj_t *s_touch_layer = NULL;
-static lv_color_t *s_cache_buffer = NULL;
+static uint32_t *s_cache_buffer = NULL;
 static lv_timer_t *s_inertia_timer = NULL;
 static lv_timer_t *s_launch_timer = NULL;
 static lv_timer_t *s_face_follow_guard_timer = NULL;
@@ -354,13 +356,34 @@ static void launcher_draw_item_label(lv_layer_t *layer,
                        lv_color_hex(0xD5D9E0), &label_area);
 }
 
+static bool launcher_create_wallpaper(lv_obj_t *parent)
+{
+    lv_obj_t *wallpaper = lv_image_create(parent);
+    if (wallpaper == NULL) {
+        return false;
+    }
+
+    lv_image_set_src(wallpaper, &launcher_wallpaper);
+    lv_obj_set_size(wallpaper, LAUNCHER_WALLPAPER_W,
+                    LAUNCHER_WALLPAPER_H);
+    lv_obj_set_pos(wallpaper, 0, 0);
+    lv_obj_add_flag(wallpaper, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_clear_flag(wallpaper, LV_OBJ_FLAG_CLICKABLE |
+                      LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_set_style_bg_opa(wallpaper, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(wallpaper, 0, 0);
+    lv_obj_set_style_pad_all(wallpaper, 0, 0);
+    return true;
+}
+
 static void launcher_render_cache(void)
 {
     if (s_cache_canvas == NULL || s_cache_buffer == NULL) {
         return;
     }
 
-    lv_canvas_fill_bg(s_cache_canvas, lv_color_black(), LV_OPA_COVER);
+    /* 缓存层是透明覆盖层，透明像素会显示固定壁纸。 */
+    lv_canvas_fill_bg(s_cache_canvas, lv_color_black(), LV_OPA_TRANSP);
 
     lv_layer_t layer;
     lv_canvas_init_layer(s_cache_canvas, &layer);
@@ -390,7 +413,7 @@ static void launcher_set_cache_position(void)
 
 static bool launcher_create_cache(lv_obj_t *parent)
 {
-    s_cache_buffer = (lv_color_t *)heap_caps_malloc(
+    s_cache_buffer = (uint32_t *)heap_caps_malloc(
         LAUNCHER_CACHE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_cache_buffer == NULL) {
         ESP_LOGE(TAG, "launcher cache allocation failed (%u bytes)",
@@ -407,7 +430,7 @@ static bool launcher_create_cache(lv_obj_t *parent)
 
     lv_canvas_set_buffer(s_cache_canvas, s_cache_buffer,
                          LAUNCHER_CACHE_W, LAUNCHER_CACHE_H,
-                         LV_COLOR_FORMAT_RGB565);
+                         LV_COLOR_FORMAT_ARGB8888);
     lv_obj_set_size(s_cache_canvas, LAUNCHER_CACHE_W, LAUNCHER_CACHE_H);
     lv_obj_set_pos(s_cache_canvas, 0, 0);
     lv_obj_add_flag(s_cache_canvas, LV_OBJ_FLAG_IGNORE_LAYOUT);
@@ -687,7 +710,8 @@ esp_err_t page_launcher_on_enter(void)
     launcher_cancel_pending_launch();
     launcher_stop_inertia();
 
-    if (!launcher_create_cache(s_grid) ||
+    if (!launcher_create_wallpaper(s_grid) ||
+        !launcher_create_cache(s_grid) ||
         !launcher_create_touch_layer(s_grid)) {
         ESP_LOGE(TAG, "launcher cache/touch layer creation failed");
         if (s_grid != NULL) {

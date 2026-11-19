@@ -127,6 +127,12 @@ esp_err_t esp_xiaozhi_chat_display_set_brightness(int brightness);
  */
 esp_err_t esp_xiaozhi_chat_display_set_notification(const char *notification, int duration_ms);
 
+/* 接收线程只复制验证码，由页面 tick 统一处理弹窗和 LCD 所有权。 */
+esp_err_t esp_xiaozhi_chat_display_show_activation_code(const char *code);
+esp_err_t esp_xiaozhi_chat_display_hide_activation_code(void);
+void esp_xiaozhi_chat_display_process_activation(void);
+bool esp_xiaozhi_chat_display_activation_popup_visible(void);
+
 /**
  * @brief Show or update the global low-voltage shutdown countdown.
  *

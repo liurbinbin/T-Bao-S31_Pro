@@ -168,8 +168,11 @@ esp_err_t app_language_init(void)
     return ESP_OK;
 }
 
-app_language_t app_language_get(void) { return s_language; }
-bool app_language_is_english(void) { return s_language == APP_LANGUAGE_EN_US; }
+app_language_t app_language_get(void)
+{
+    return __atomic_load_n(&s_language, __ATOMIC_ACQUIRE);
+}
+bool app_language_is_english(void) { return app_language_get() == APP_LANGUAGE_EN_US; }
 
 esp_err_t app_language_set(app_language_t language)
 {
@@ -187,7 +190,7 @@ esp_err_t app_language_set(app_language_t language)
     }
     nvs_close(handle);
     if (ret == ESP_OK) {
-        s_language = language;
+        __atomic_store_n(&s_language, language, __ATOMIC_RELEASE);
     }
     return ret;
 }

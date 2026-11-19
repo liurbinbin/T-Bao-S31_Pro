@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -20,6 +21,22 @@ extern "C" {
  *         stored; other esp_err_t on connect failure / timeout.
  */
 esp_err_t wifi_sta_connect_from_nvs(int timeout_ms);
+
+/** @brief Return true when the station currently has an AP connection. */
+bool wifi_sta_is_connected(void);
+
+/* 复用唯一 Wi-Fi 生命周期；离线时仅启动 STA 无线电供 ESP-NOW 使用。 */
+esp_err_t wifi_prepare_petlink(void);
+esp_err_t wifi_petlink_enter(void);
+void wifi_petlink_leave(void);
+
+/**
+ * @brief Consume an explicit provisioning request left by the WiFi reset UI.
+ *
+ * The request is cleared before returning when possible, so a power cycle
+ * during setup does not force provisioning forever.
+ */
+bool wifi_provisioning_take_request(void);
 
 /**
  * @brief Enter SoftAP provisioning mode. NEVER returns.
@@ -40,11 +57,11 @@ void provisioning_enter(void);
 void provisioning_hide_screen(void);
 
 /**
- * @brief Erase the stored WiFi credentials and reboot the chip.
+ * @brief Erase the stored WiFi credentials and schedule provisioning.
  *
- * Used by the UI "重置 WiFi" button: after a short delay (so the user sees the
- * confirmation), the chip reboots into SoftAP provisioning mode. Does not
- * return.
+ * Used by the UI "重置 WiFi" button: a background task erases the credentials,
+ * records an explicit provisioning request, and reboots after a short delay.
+ * The next boot enters SoftAP provisioning outside the LVGL task.
  */
 void wifi_creds_erase_and_reboot(void);
 
