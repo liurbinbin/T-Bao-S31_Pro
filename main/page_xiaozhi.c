@@ -220,8 +220,8 @@ esp_err_t page_xiaozhi_on_enter(void)
     lv_obj_clear_flag(guide, LV_OBJ_FLAG_SCROLLABLE);
 
     const char *steps[] = {
-        app_language_text("第一次呼叫：你好小智", "First call: Hello Xiaozhi"),
-        app_language_text("第二次：你好小智，讲个笑话", "Then: Ask for a joke"),
+        app_language_text("第一次呼叫：你好小智", "First call: nihao Xiaozhi"),
+        app_language_text("第二次：你好小智，讲个笑话", "Then: nihao Xiaozhi, tell me a joke"),
     };
     const char *hints[] = {
         app_language_text("仅唤醒小智", "Wake Xiaozhi only"),

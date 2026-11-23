@@ -8,7 +8,7 @@ AI pet firmware for the **T-Bao S31 / ESP32-S31**. It combines Xiaozhi voice cha
 
 ## Features
 
-- **Xiaozhi voice chat**: the offline wake word "你好小智" with WebSocket cloud ASR, LLM, and TTS, plus emote states and live captions.
+- **Xiaozhi voice chat**: the offline wake word "nihao xiaozhi" with WebSocket cloud ASR, LLM, and TTS, plus emote states and live captions.
 - **Touch UI**: LVGL 9 and `esp_emote_expression` with launcher, dialogue, camera, music, video, game, timer, motion, settings, and about pages.
 - **Camera and vision**: OV2640/OV3660-compatible PARLIO JPEG camera with on-screen preview, HTTP MJPEG `/stream`, JPEG `/snapshot`, recording, lightweight face detection/face following, and guard mode.
 - **Media playback**: local audio/video from microSD; online music search resolves a playable URL from multiple public APIs.
@@ -67,7 +67,7 @@ After flashing, Xiaozhi AI is disabled by default and the device can enter its o
 
 ### Voice control behavior
 
-After boot, call "你好小智" once. The device responds, but this first response only enters the wake state and does not start a conversation. Call "你好小智" a second time; the device may not respond again, but you can then say something such as "Tell me a joke" to start the conversation. If the device later stops responding, call "你好小智" again to wake it.
+After boot, call "nihao xiaozhi" once. The device responds, but this first response only enters the wake state and does not start a conversation. Call "你好小智" a second time; the device may not respond again, but you can then say something such as "Tell me a joke" to start the conversation. If the device later stops responding, call "你好小智" again to wake it.
 
 ### Motion calibration
 
